@@ -1,0 +1,64 @@
+[project]
+name = "fb-dump"
+version = "1.0.0"
+description = "Dump a Firebird database schema as one .sql file per object"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "deliciousNesquik" }]
+keywords = ["firebird", "schema", "ddl", "database", "migration", "versioning", "git"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Version Control",
+]
+dependencies = [
+    "firebird-driver>=2.0",
+    "firebird-lib>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/deliciousNesquik/fb-dump"
+Repository = "https://github.com/deliciousNesquik/fb-dump"
+Issues = "https://github.com/deliciousNesquik/fb-dump/issues"
+
+[project.scripts]
+fb-dump = "fb_dump.cli:main"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1",
+    "pytest>=8",
+    "pytest-cov>=5",
+]
+# Release binaries only (uv sync --group build); kept out of dev on purpose.
+build = [
+    "pyinstaller>=6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["fb_dump"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=fb_dump --cov-report=term-missing --cov-fail-under=80"
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+skip_covered = false
+show_missing = true
