@@ -1,0 +1,34 @@
+# Local environment files (credentials) — keep only the template
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# uv: local index/CA configuration and lock file are not part of the public repo
+uv.toml
+uv.lock
+
+# PyInstaller
+/build/
+/dist/
+*.spec
+
+# GitHub Pages
+/docs/_site/
+
+# Default output of a local dump
+/schema/
+
+# macOS
+.DS_Store
+
+# Instructions for Claude
+CLAUDE.md
