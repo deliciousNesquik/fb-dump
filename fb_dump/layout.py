@@ -64,6 +64,8 @@ PRESETS: dict[str, dict[str, Any]] = {
 _ALLOWED_KEYS = {"version", "base", "file", "database", "dirs", "files"}
 _PLACEHOLDERS = {"name", "type"}
 _UNSAFE_CHARS = set('/\\:*?"<>|')
+_UNSAFE_NO_SEP = _UNSAFE_CHARS - {"/", "\\"}
+_UNSAFE_LIST = ': * ? " < > |'
 _RESERVED_STEMS = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
 
 
@@ -99,6 +101,10 @@ class Layout:
         filename = template.format(name=safe_component(name), type=key)
         directory = self.dirs[key]
         return f"{directory}/{filename}" if directory else filename
+
+    def top_level_entries(self) -> set[str]:
+        """Names a tree of this layout may contain at its root (besides object files placed there)."""
+        return {self.database} | {d.split("/", 1)[0] for d in self.dirs.values() if d}
 
     def to_toml(self) -> str:
         """Serialise as the manifest written into every tree (deterministic, no timestamps)."""
@@ -137,7 +143,7 @@ def load(spec: str) -> Layout:
     if not path.is_file():
         raise LayoutError(f"layout {spec!r} is neither a preset ({', '.join(PRESETS)}) nor an existing file")
     try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        data = tomllib.loads(path.read_text(encoding="utf-8-sig"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise LayoutError(f"{path}: {exc}") from exc
     return from_dict(data, source=str(path))
@@ -149,7 +155,7 @@ def load_manifest(tree: Path) -> Layout | None:
     if not manifest.is_file():
         return None
     try:
-        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        data = tomllib.loads(manifest.read_text(encoding="utf-8-sig"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise LayoutError(f"{manifest}: {exc}") from exc
     return from_dict(data, source=str(manifest))
@@ -185,8 +191,9 @@ def from_dict(data: Mapping[str, Any], source: str) -> Layout:
     _check_template(file, f"{source}: file")
     for k, v in files.items():
         _check_template(v, f"{source}: files.{k}")
-    if not isinstance(database, str) or not database or "/" in database or "\\" in database or database.strip(". ") != database:
-        raise LayoutError(f"{source}: database must be a plain file name")
+    if (not isinstance(database, str) or not database or _unsafe(database) or "/" in database
+            or "\\" in database or database.strip(". ") != database):
+        raise LayoutError(f"{source}: database must be a plain file name without {_UNSAFE_LIST}")
     return Layout(dirs=dirs, file=file, files=files, database=database)
 
 
@@ -203,23 +210,37 @@ def _str_table(value: Any, where: str) -> dict[str, str]:
     return out
 
 
+def _unsafe(text: str) -> bool:
+    return bool(set(text) & _UNSAFE_NO_SEP) or any(ord(ch) < 32 for ch in text)
+
+
 def _normalize_dir(value: str, where: str) -> str:
     parts = [p for p in value.replace("\\", "/").split("/") if p not in ("", ".")]
-    if any(p == ".." for p in parts) or value.startswith(("/", "\\")) or (len(value) > 1 and value[1] == ":"):
-        raise LayoutError(f"{where}: directory must be relative to the tree and must not contain '..'")
+    if value.startswith(("/", "\\")) or any(p == ".." or _unsafe(p) or p.strip(". ") != p for p in parts):
+        raise LayoutError(f"{where}: directory must be relative to the tree, without '..', "
+                          f"drive letters or {_UNSAFE_LIST}")
     return "/".join(parts)
 
 
 def _check_template(template: Any, where: str) -> None:
     if not isinstance(template, str) or not template:
         raise LayoutError(f"{where} must be a non-empty string")
+    fields: set[str] = set()
+    literal = ""
     try:
-        fields = {f for _, f, _, _ in string.Formatter().parse(template) if f is not None}
+        for text, name, spec, conversion in string.Formatter().parse(template):
+            literal += text
+            if name is not None:
+                fields.add(name)
+                if spec or conversion:
+                    raise LayoutError(f"{where}: placeholders take no format spec or conversion ({{{name}}} only)")
     except ValueError as exc:
         raise LayoutError(f"{where}: {exc}") from exc
+    if "/" in literal or "\\" in literal:
+        raise LayoutError(f"{where}: template must not contain path separators (use [dirs])")
+    if _unsafe(literal):
+        raise LayoutError(f"{where}: template must not contain {_UNSAFE_LIST} or control characters")
     if "name" not in fields:
         raise LayoutError(f"{where}: template must contain {{name}}")
     if fields - _PLACEHOLDERS:
         raise LayoutError(f"{where}: unknown placeholders {', '.join(sorted(fields - _PLACEHOLDERS))}; allowed: {{name}}, {{type}}")
-    if "/" in template or "\\" in template:
-        raise LayoutError(f"{where}: template must not contain path separators (use [dirs])")

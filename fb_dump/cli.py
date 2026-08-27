@@ -39,8 +39,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("names", nargs="*", metavar="NAME",
                    help="object names to export; none = full dump")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    p.add_argument("-q", "--quiet", action="store_true", help="errors only")
-    p.add_argument("-v", "--verbose", action="store_true", help="debug output")
+    verbosity = p.add_mutually_exclusive_group()
+    verbosity.add_argument("-q", "--quiet", action="store_true", help="errors only")
+    verbosity.add_argument("-v", "--verbose", action="store_true", help="debug output")
 
     conn = p.add_argument_group("connection")
     conn.add_argument("-d", "--database", metavar="DSN",
@@ -57,14 +58,16 @@ def _build_parser() -> argparse.ArgumentParser:
     out = p.add_argument_group("output")
     out.add_argument("-o", "--out", metavar="DIR", help="write the tree here instead of stdout")
     out.add_argument("--layout", metavar="PRESET|FILE",
-                     help=f"directory layout: {', '.join(layout.PRESETS)} or a TOML file "
-                          f"[default {layout.DEFAULT_PRESET}; a tree's own {layout.MANIFEST} wins for targeted exports]")
+                     help=f"directory layout: {', '.join(layout.PRESETS)} or a TOML file [default "
+                          f"{layout.DEFAULT_PRESET}]; a targeted export into an existing tree uses the tree's "
+                          f"own {layout.MANIFEST}, and an explicit --layout must match it")
     out.add_argument("--print-layout", action="store_true",
                      help="print the effective layout as TOML (a starting point for your own) and exit")
     out.add_argument("--allow-partial", action="store_true",
                      help="full dump: write the tree even if some objects could not be dumped")
     out.add_argument("--force", action="store_true",
-                     help=f"write into a non-empty directory that has no {layout.MANIFEST}")
+                     help=f"full dump: replace a non-empty directory that has no {layout.MANIFEST} or that "
+                          f"contains foreign entries; targeted export: write into such a directory")
 
     sel = p.add_argument_group("selection")
     sel.add_argument("--type", dest="type", choices=categories.TYPE_CHOICES, metavar="TYPE",
@@ -129,15 +132,27 @@ def run_list(ctx: Context, type_alias: str | None) -> int:
     return EXIT_OK
 
 
+def _preload(ctx: Context) -> None:
+    """Load the schema-wide collections per-object code depends on *before* the
+    per-object loop, so a collection that cannot be read at all surfaces as an
+    infrastructure error (exit 1, charset hint) instead of one failure per object."""
+    for name in ("constraints", "character_sets"):
+        getattr(ctx.schema, name, None)
+    ctx.grants  # noqa: B018 — builds the privilege index
+
+
 def run_full(ctx: Context, out_dir: Path | None, allow_partial: bool, force: bool) -> int:
     log.info("Reading the schema...")
+    _preload(ctx)
     col = Collector()
     col.add_section("database", lambda: categories.database_preamble(ctx))
     for cat in categories.CATEGORIES:
         for obj in sorted(cat.objects(ctx.schema), key=cat.name_of):  # sorted: stable diffs
             col.add(ctx, cat, obj)
     if ctx.grants.unmapped:
-        log.debug(f"{len(ctx.grants.unmapped)} privilege(s) on objects outside the dump were ignored")
+        log.debug(f"{len(ctx.grants.unmapped)} privilege(s) of unknown subject types were ignored")
+    if left := ctx.grants.unconsumed():
+        log.info(f"Privileges on {len(left)} object(s) not in the dump (system objects) were not written")
 
     if col.failures and not allow_partial:
         log.error(f"{len(col.failures)} object(s) could not be dumped; nothing written "
@@ -149,7 +164,8 @@ def run_full(ctx: Context, out_dir: Path | None, allow_partial: bool, force: boo
         count = writer.write_stdout(grouped)
         where = "printed"
     else:
-        count = writer.replace_tree(grouped, out_dir, ctx.layout.to_toml(), force)
+        count = writer.replace_tree(grouped, out_dir, ctx.layout.to_toml(), force,
+                                    owned=ctx.layout.top_level_entries())
         where = f"written to {out_dir}"
     log.info(f"Done: {count} file(s) {where}; {len(col.failures)} object(s) skipped")
     return EXIT_PARTIAL if col.failures else EXIT_OK
@@ -160,12 +176,17 @@ def run_targeted(ctx: Context, out_dir: Path | None, names: list[str], type_alia
     resolved = selection.resolve(ctx.schema, names, type_alias)
     for name in resolved.missing:
         log.warning(f"Object not found: {name}")
+    if resolved.matches:
+        _preload(ctx)
 
     col = Collector()
     for cat, obj in resolved.matches:
         col.add(ctx, cat, obj)
 
     grouped = writer.group(col.artifacts)
+    if not grouped:
+        log.error("Nothing to write")
+        return EXIT_PARTIAL
     if out_dir is None:
         count = writer.write_stdout(grouped)
         where = "printed"
@@ -211,6 +232,10 @@ def main(argv: list[str] | None = None) -> int:
     log.set_level(log.QUIET if args.quiet else log.VERBOSE if args.verbose else log.NORMAL)
 
     out_dir = Path(args.out) if args.out else None
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure) and not sys.stdout.isatty():
+        # Same bytes as --out: UTF-8 and LF, whatever the locale or platform.
+        reconfigure(encoding="utf-8", newline="\n")
     try:
         lay = _choose_layout(args, out_dir)
     except layout.LayoutError as exc:
