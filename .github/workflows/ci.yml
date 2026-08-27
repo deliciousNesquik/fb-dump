@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # firebird-driver loads libfbclient lazily (on connect); installed anyway so
+      # importing the driver is safe in every environment.
+      - name: Install Firebird client library
+        run: sudo apt-get update && sudo apt-get install -y libfbclient2
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Sync dependencies
+        run: uv sync --dev
+
+      - name: Type-check
+        run: uv run pyright fb_dump
+
+      - name: Tests (coverage gate 80%)
+        run: uv run pytest -q
