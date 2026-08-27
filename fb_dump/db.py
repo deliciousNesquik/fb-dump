@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import firebird.lib.schema as _fb_schema
+from firebird.lib.schema import COLUMN_TYPES, INTEGRAL_SUBTYPES, Domain, FieldSubType, FieldType, SchemaItem
 from firebird.driver import TraAccessMode, driver_config
 from firebird.driver import connect as _connect
 from firebird.driver import tpb as _driver_tpb
@@ -39,6 +40,44 @@ _fb_schema.tpb = _nowait_tpb
 # PSQL source as a string, and a source above the default 64 KiB threshold comes
 # back as a BlobReader, making get_sql_for fail with "can only concatenate str".
 driver_config.stream_blob_threshold.value = 256 * 1024 * 1024
+
+
+# Firebird 4 data types firebird-lib 2.0 has no SQL spelling for: without these a
+# domain/column/parameter of such a type raises KeyError inside get_sql_for.
+_FB4_TYPES: dict[Any, str] = {
+    FieldType.INT128: "INT128",
+    FieldType.DEC16: "DECFLOAT(16)",
+    FieldType.DEC34: "DECFLOAT(34)",
+    FieldType.TIME_TZ: "TIME WITH TIME ZONE",
+    FieldType.TIMESTAMP_TZ: "TIMESTAMP WITH TIME ZONE",
+    FieldType.TIME_TZ_EX: "TIME WITH TIME ZONE",
+    FieldType.TIMESTAMP_TZ_EX: "TIMESTAMP WITH TIME ZONE",
+}
+for _ft, _sql in _FB4_TYPES.items():
+    COLUMN_TYPES.setdefault(_ft, _sql)
+
+_lib_datatype = Domain.datatype
+
+
+def _datatype(self: Any) -> str:
+    """Domain.datatype with Firebird 4 types; every column/parameter type funnels through it."""
+    ft = self.field_type
+    if ft in _FB4_TYPES:
+        if ft is FieldType.INT128 and self.precision and self.sub_type in (FieldSubType.NUMERIC, FieldSubType.DECIMAL):
+            return f"{INTEGRAL_SUBTYPES[self.sub_type]}({self.precision}, {-self.scale})"
+        return _FB4_TYPES[ft]
+    return _lib_datatype.fget(self)  # type: ignore[union-attr]
+
+
+Domain.datatype = property(_datatype)  # type: ignore[assignment]
+
+
+def _is_sys_object(self: Any) -> bool:
+    """RDB$SYSTEM_FLAG may be NULL in databases that started life on InterBase; NULL means user."""
+    return (self._attributes.get("RDB$SYSTEM_FLAG") or 0) > 0
+
+
+SchemaItem.is_sys_object = _is_sys_object  # type: ignore[method-assign]
 
 
 def connect(settings: Settings, charset: str | None = None):  # noqa: ANN201
