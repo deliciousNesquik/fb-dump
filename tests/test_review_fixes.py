@@ -235,3 +235,37 @@ def test_system_role_privileges_are_reported(monkeypatch, capsys):
     _fake_driver(monkeypatch, FSchema(tables=[FObj("A")], privileges=[FPriv("U", "S", "RDB$DATABASE")]))
     assert cli.main([]) == 0
     assert "not in the dump (system objects)" in capsys.readouterr().err
+
+
+def test_target_is_checked_before_connecting(monkeypatch, tmp_path, capsys):
+    """A doomed --out must be reported without reading the schema (that takes minutes)."""
+    calls: list[str] = []
+
+    def boom(settings, charset=None):
+        calls.append("connect")
+        raise AssertionError("must not connect")
+
+    monkeypatch.setenv("FB_DATABASE", "fake")
+    monkeypatch.setattr(cli.db, "connect", boom)
+    foreign = tmp_path / "work"
+    foreign.mkdir()
+    (foreign / "notes.txt").write_text("keep")
+
+    assert cli.main(["-o", str(foreign)]) == 1
+    assert calls == []
+    assert "was not written by fb-dump" in capsys.readouterr().err
+    assert (foreign / "notes.txt").exists()
+
+    # a tree of ours with a foreign entry is refused just as early…
+    tree = tmp_path / "schema"
+    writer.replace_tree(_g(("DATABASE.sql", "D")), tree, MAN, owned=OWNED)
+    (tree / ".git").mkdir()
+    assert cli.main(["-o", str(tree)]) == 1
+    assert calls == []
+    assert "a full dump would delete" in capsys.readouterr().err
+    # …but a targeted export into it is allowed (it deletes nothing)
+    monkeypatch.setattr(cli.db, "open_schema", lambda settings, con: FSchema(tables=[FObj("A")]))
+    monkeypatch.setattr(cli.db, "dialect", lambda con: 3)
+    monkeypatch.setattr(cli.db, "connect", lambda settings, charset=None: type("C", (), {"close": lambda self: None})())
+    assert cli.main(["A", "-o", str(tree)]) == 0
+    assert (tree / ".git").exists()

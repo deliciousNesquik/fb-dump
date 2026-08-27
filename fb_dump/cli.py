@@ -252,6 +252,15 @@ def main(argv: list[str] | None = None) -> int:
         log.error(str(exc))
         return EXIT_USAGE
 
+    if out_dir is not None:
+        # Fail before spending minutes on the catalog if the target is unusable.
+        try:
+            writer.precheck_target(out_dir, args.force,
+                                   owned=None if args.names else lay.top_level_entries())
+        except writer.WriterError as exc:
+            log.error(str(exc))
+            return EXIT_INFRA
+
     log.debug(f"database={settings.database} user={settings.user or '(driver default)'} "
               f"role={settings.role or '-'} charset={settings.charset} fallback={settings.fallback_charset or '-'}")
 

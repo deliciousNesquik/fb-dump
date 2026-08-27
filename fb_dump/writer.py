@@ -92,6 +92,17 @@ def _check_unowned_entries(out_dir: Path, owned: Iterable[str] | None, force: bo
                           f"directory) or pass --force")
 
 
+def precheck_target(out_dir: Path, force: bool = False, owned: Iterable[str] | None = None) -> None:
+    """Validate the output directory *before* the schema is read.
+
+    Reading a large schema takes minutes; a target that can never be written to
+    should be reported in milliseconds. The same checks run again inside
+    ``replace_tree``/``update_tree`` — the directory may change while we read."""
+    out_dir = Path(out_dir).resolve()
+    _check_target(out_dir, force)
+    _check_unowned_entries(out_dir, owned, force)
+
+
 def _write_files(grouped: Grouped, root: Path) -> int:
     for rel, statements in grouped.items():
         path = root / rel
