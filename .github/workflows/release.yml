@@ -1,0 +1,61 @@
+name: Release
+
+# Self-contained binaries for Windows/Linux/macOS, attached to the GitHub Release.
+# Runs on a tag push like v1.2.3.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: fb-dump-linux-x64
+          - os: windows-latest
+            asset: fb-dump-windows-x64.exe
+          - os: macos-latest
+            asset: fb-dump-macos-arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      # PyInstaller lags behind the newest Python releases; pin a stable one.
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install deps + build group
+        run: uv sync --group build
+
+      - name: Build standalone binary
+        run: >
+          uv run pyinstaller --onefile --noconfirm --name fb-dump
+          --collect-all firebird.driver --collect-all firebird.lib
+          --collect-all firebird.base
+          pyinstaller_entry.py
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p out
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mv dist/fb-dump.exe "out/${{ matrix.asset }}"
+          else
+            mv dist/fb-dump "out/${{ matrix.asset }}"
+            chmod +x "out/${{ matrix.asset }}"
+          fi
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/${{ matrix.asset }}
+          fail_on_unmatched_files: true
