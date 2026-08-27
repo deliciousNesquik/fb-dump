@@ -127,13 +127,13 @@ fb-dump -d DSN --list | cut -f2 | sort        # pipe-friendly
 | `--layout PRESET\|FILE` | full, targeted | `numbered` (default), `plain`, `flat`, or a TOML file. |
 | `--print-layout` | — | Print the effective layout as TOML and exit (no database connection). |
 | `--allow-partial` | full | Write the tree even if some objects could not be dumped. |
-| `--force` | `--out` | Use a non-empty directory that has no `.fb-dump.toml`. |
+| `--force` | `--out` | Full dump: replace a directory that has no `.fb-dump.toml` or that contains foreign entries; targeted export: write into such a directory. |
 | `--type TYPE` | targeted, list | Restrict to one category. |
 | `--list` | list | List objects and exit. |
 | `-q`, `--quiet` / `-v`, `--verbose` | all | Errors only / debug output (stderr). |
 | `--version`, `-h` | — | |
 
-**`--type` values:** `table`, `index`, `view`, `procedure` (`proc`), `function`, `external-function` (`udf`), `trigger`, `exception`, `domain`, `generator` (`sequence`), `role`, `package`, `collation`.
+**`--type` values:** `table`, `index`, `view`, `procedure` (`proc`), `function`, `external-function` (`external_function`, `udf`), `trigger`, `exception`, `domain`, `generator` (`sequence`), `role`, `package`, `collation` — the same words `--list` prints.
 
 Diagnostics go to **stderr**; stdout carries only data.
 
@@ -146,20 +146,22 @@ Each file is the whole object, in this order: definition, comments, grants.
 | role | `CREATE ROLE` | `COMMENT ON ROLE`; role memberships: `GRANT role TO user [WITH ADMIN OPTION]`, `GRANT DEFAULT role TO …` |
 | collation | `CREATE COLLATION` | comment |
 | external function (UDF) | `DECLARE EXTERNAL FUNCTION` | comment, `GRANT EXECUTE` |
-| generator | `CREATE SEQUENCE` | comment, `GRANT USAGE`. **No current value** — that is data, not schema. |
+| generator | `CREATE SEQUENCE` with the declared `START WITH` / `INCREMENT BY` (Firebird 4+) | comment, `GRANT USAGE`. **No current value** — that is data, not schema. |
 | exception | `CREATE OR ALTER EXCEPTION` | comment, `GRANT USAGE` |
 | domain | `CREATE DOMAIN` | comment |
-| table | `CREATE TABLE`, then every constraint as a named `ALTER TABLE … ADD CONSTRAINT` (PK, UNIQUE, CHECK, FK) | table and column comments, `GRANT SELECT, INSERT, UPDATE (cols) …` |
-| index | `CREATE INDEX` (+ `ALTER INDEX … INACTIVE` if the index is inactive) | comment |
-| function | `CREATE OR ALTER FUNCTION` | comment, `GRANT EXECUTE` |
+| table | `CREATE TABLE` (with `ON COMMIT …` for temporary tables), `ALTER TABLE … SET GENERATED ALWAYS` / `SET INCREMENT BY` for Firebird 4 identity columns, `ALTER TABLE … ALTER SQL SECURITY`, then every constraint as a named `ALTER TABLE … ADD CONSTRAINT` (PK, UNIQUE, CHECK, FK) | table and column comments, `GRANT SELECT, INSERT, UPDATE (cols) …` |
+| index | `CREATE INDEX` (+ `WHERE …` for Firebird 5 partial indices, `ALTER INDEX … INACTIVE` if the index is inactive) | comment |
+| function | `CREATE OR ALTER FUNCTION` (`DETERMINISTIC` kept; UDR routines as `EXTERNAL NAME … ENGINE …`) | comment, `GRANT EXECUTE` |
 | view | `CREATE OR ALTER VIEW` | view and column comments, grants |
-| procedure | `CREATE OR ALTER PROCEDURE` | procedure and parameter comments, `GRANT EXECUTE` |
+| procedure | `CREATE OR ALTER PROCEDURE` (UDR routines as `EXTERNAL NAME … ENGINE …`) | procedure and parameter comments, `GRANT EXECUTE` |
 | package | `CREATE OR ALTER PACKAGE` + `RECREATE PACKAGE BODY` | comment, `GRANT EXECUTE` |
-| trigger | `CREATE OR ALTER TRIGGER` (with its ACTIVE/INACTIVE state) | comment |
+| trigger | `CREATE OR ALTER TRIGGER` (ACTIVE/INACTIVE state; DML, database and DDL triggers; UDR triggers) | comment |
 
-`DATABASE.sql` holds `SET SQL DIALECT n`, the default character set (as a comment), the database comment, and database-level privileges (`GRANT CREATE TABLE TO …`, `GRANT ALTER ANY PROCEDURE TO …`, `GRANT ALTER DATABASE TO …`).
+`DATABASE.sql` holds `SET SQL DIALECT n`, the default character set (as a comment), the database comment, changed default collations (`ALTER CHARACTER SET … SET DEFAULT COLLATION`), database-level privileges (`GRANT CREATE TABLE TO …`, `GRANT ALTER ANY PROCEDURE TO …`, `GRANT ALTER DATABASE TO …`) and memberships of system roles (`GRANT RDB$ADMIN TO USER …`).
 
-Not dumped: system objects (`RDB$…`, constraint-enforcing indices and triggers, identity generators), packaged procedures/functions (they are inside the package body), the owner's implicit privileges on its own objects, generator values, users, shadows. PSQL objects are wrapped in `SET TERM ^ ;` … `SET TERM ; ^`; everything else ends with `;`. The output order is fixed (categories, then names), so repeated dumps of the same schema are byte-identical.
+Grantees are always qualified — `TO USER JOE`, `TO ROLE READERS`, `TO PROCEDURE P` — so a user and a role with the same name cannot be confused on replay, and a privilege granted by someone other than the object's owner carries `GRANTED BY`.
+
+Not dumped: system objects (`RDB$…`, constraint-enforcing indices and triggers, identity generators), packaged procedures/functions (they are inside the package body), the owner's implicit privileges on its own objects, generator values, users, shadows. Privileges on system objects are counted and reported, not written. PSQL objects are wrapped in `SET TERM ^ ;` … `SET TERM ; ^`; everything else ends with `;`. The output order is fixed (categories, then names), so repeated dumps of the same schema are byte-identical.
 
 ## Directory layout and file names
 
@@ -196,16 +198,17 @@ index  = "{name}.index.sql"
 fb-dump -d DSN -o schema --layout my-layout.toml
 ```
 
-Categories you do not mention retain values from `base`. Directory names can be anything your file system accepts, including non-Latin names; they must stay inside the tree (no absolute paths, no `..`). Object names are sanitized for the file system (path separators, Windows-forbidden characters, and reserved names like `CON`).
+Categories you do not mention retain values from `base`. Directory names can be anything your file system accepts, including non-Latin names; they must stay inside the tree (no absolute paths, drive letters or `..`) and must not contain characters Windows rejects (`: * ? " < > |`). Templates take the bare `{name}` and `{type}` placeholders only. Object names are sanitized the same way (plus reserved names like `CON`).
 
 Every tree stores its effective layout in **`.fb-dump.toml`**. This file makes the tree self-describing for any consumer, allows targeted exports to find the right files without knowing the layout in advance, and marks the directory as belonging to fb-dump — a non-empty directory without it will not be touched unless you pass `--force`.
 
 ## Guarantees
 
 - **Full dump — all or nothing.** The tree is assembled in a staging directory next to the target and swapped in via rename. If even one object fails to read, *nothing* is written, and the exit code is 3: a half-written tree would appear in version control as objects being *deleted*, which is a false record. `--allow-partial` disables this behavior.
-- **Your directory is safe.** `--out` must be empty, non-existent, or a tree written by fb-dump. Point it to a repository subdirectory, not its root.
+- **Your directory is safe.** `--out` must be empty, non-existent, or a tree written by fb-dump — and even then a full dump refuses to delete entries the layout does not account for (a `.git` directory, a README) unless you pass `--force`. Keep the tree in its own directory: a repository subdirectory, not its root.
+- **The swap adapts.** Normally the new tree is built next to the target and renamed into place. When the target cannot be renamed — it is a mount point (a Docker volume), your current directory, or Windows has a file in it open — the tree is rebuilt in place: new files first, old entries removed last, never a half-written file.
 - **Determinism.** One schema → the same bytes. No timestamps in the output.
-- **Read-only.** fb-dump never does anything to the directory except read it.
+- **Read-only.** fb-dump only ever reads the database catalog; it never writes to the database.
 - **Object-level resilience.** A single object that fails to render (no permissions, strange metadata) is logged and counted; it never aborts the run. A collection that cannot be read entirely is an infrastructure error (code 1).
 
 Transactions are **read committed, record version, NO WAIT**: fb-dump never waits on a lock. Consequently, a dump is *not* a point-in-time snapshot: DDL committed during the dump may end up in some collections and not in others. Take the dump when the schema is not changing.
@@ -239,6 +242,7 @@ Concatenating files in directory order (`fb-dump -d DSN > all.sql` does exactly 
 - Not byte-identical to `isql -x`: firebird-lib formats DDL differently (semantically equivalent).
 - No point-in-time snapshot (see [Guarantees](#guarantees)).
 - Comments on function *parameters* are not dumped (firebird-lib does not provide `COMMENT ON` for them); procedure parameters, columns, and comments on all objects are dumped.
+- `SQL SECURITY DEFINER|INVOKER` (Firebird 4) is dumped for tables only; firebird-lib does not read it for procedures, functions, triggers and packages. Role system privileges (`ALTER ROLE … SET SYSTEM PRIVILEGES`) are not dumped either.
 - Shadows, BLOB filters, users, and mappings are not the schema objects that fb-dump knows about.
 - Firebird 2.5 is out of scope (different driver).
 - Full dump reads some object metadata lazily; over a slow connection, a large database takes a long time to dump. Run it closer to the server.
