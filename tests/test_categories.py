@@ -1,4 +1,4 @@
-from fakes import FChild, FConstraint, FObj, FPriv, FSchema
+from fakes import FChild, FConstraint, FGenerator, FObj, FPriv, FSchema
 
 from fb_dump import categories
 from fb_dump.layout import preset
@@ -29,7 +29,7 @@ def test_table_file_is_complete_definition():
         "ALTER TABLE ADD CONSTRAINT FK1 (fkey)",
         "COMMENT ON ACC IS 'Accounts'",
         "COMMENT ON CHILD ID IS 'identifier'",
-        "GRANT SELECT ON ACC TO U1",
+        "GRANT SELECT ON ACC TO USER U1",
     ]
     assert not any(a.psql for a in arts)
 
@@ -46,37 +46,39 @@ def test_procedure_single_file_with_params_and_grants():
     ctx = _ctx(privileges=[FPriv("U", "X", "CALC", subject_type=5)])
     arts = categories.CATEGORY_BY_KEY["procedure"].emit(ctx, p)
     assert [a.sql for a in arts] == [
-        "CREATE OR ALTER OBJ CALC",
+        "CREATE OR ALTER OBJ CALC\nRETURNS INTEGER\nAS\nBEGIN END",
         "COMMENT ON CALC IS 'd'",
         "COMMENT ON CHILD A IS 'in a'",
         "COMMENT ON CHILD R IS 'out r'",
-        "GRANT EXECUTE ON PROCEDURE CALC TO U",
+        "GRANT EXECUTE ON PROCEDURE CALC TO USER U",
     ]
     assert [a.psql for a in arts] == [True, False, False, False, False]
 
 
 def test_package_header_and_body():
     ctx = _ctx()
-    assert _sql(ctx, "package", FObj("K", body="x")) == ["CREATE OR ALTER OBJ K", "RECREATE PACKAGE BODY K"]
-    assert _sql(ctx, "package", FObj("K")) == ["CREATE OR ALTER OBJ K"]
+    assert _sql(ctx, "package", FObj("K", body="x")) == ["CREATE OR ALTER OBJ K\nRETURNS INTEGER\nAS\nBEGIN END", "RECREATE PACKAGE BODY K"]
+    assert _sql(ctx, "package", FObj("K")) == ["CREATE OR ALTER OBJ K\nRETURNS INTEGER\nAS\nBEGIN END"]
 
 
-def test_generator_has_no_runtime_value():
+def test_generator_definition_without_runtime_value():
     ctx = _ctx(privileges=[FPriv("U", "G", "GEN", subject_type=14)])
-    assert _sql(ctx, "generator", FObj("GEN")) == ["CREATE OBJ GEN", "GRANT USAGE ON SEQUENCE GEN TO U"]
+    assert _sql(ctx, "generator", FObj("GEN")) == ["CREATE OBJ GEN", "GRANT USAGE ON SEQUENCE GEN TO USER U"]
+    assert _sql(ctx, "generator", FObj("G2", increment=10, initial=1000)) == ["CREATE OBJ G2 increment=10 value=1000"]
+    assert _sql(ctx, "generator", FObj("G3", increment=1, initial=0)) == ["CREATE OBJ G3"]
 
 
 def test_role_file_has_memberships():
     ctx = _ctx(privileges=[FPriv("U1", "M", "R", subject_type=13), FPriv("SYSDBA", "M", "R", subject_type=13)])
-    assert _sql(ctx, "role", FObj("R")) == ["CREATE OBJ R", "GRANT R TO U1"]
+    assert _sql(ctx, "role", FObj("R")) == ["CREATE OBJ R", "GRANT R TO USER U1"]
 
 
 def test_view_and_udf_and_trigger():
     ctx = _ctx(privileges=[FPriv("U", "S", "V", subject_type=0), FPriv("U", "X", "F", subject_type=15)])
     assert _sql(ctx, "view", FObj("V", columns=[FChild("C", "col")])) == [
-        "CREATE OR ALTER OBJ V", "COMMENT ON CHILD C IS 'col'", "GRANT SELECT ON V TO U"]
+        "CREATE OR ALTER OBJ V\nRETURNS INTEGER\nAS\nBEGIN END", "COMMENT ON CHILD C IS 'col'", "GRANT SELECT ON V TO USER U"]
     assert _sql(ctx, "external_function", FObj("F", external=True)) == [
-        "DECLARE EXTERNAL FUNCTION F", "GRANT EXECUTE ON FUNCTION F TO U"]
+        "DECLARE EXTERNAL FUNCTION F", "GRANT EXECUTE ON FUNCTION F TO USER U"]
     arts = categories.CATEGORY_BY_KEY["trigger"].emit(ctx, FObj("TR"))
     assert arts[0].psql and arts[0].path == "13_TRIGGERS/TR.sql"
 
@@ -85,7 +87,7 @@ def test_quoted_object_names_are_quoted_in_grants_and_safe_in_paths():
     ctx = _ctx(privileges=[FPriv("U", "S", "my/table")])
     arts = categories.CATEGORY_BY_KEY["table"].emit(ctx, FObj("my/table"))
     assert arts[0].path == "07_TABLES/my_table.sql"
-    assert arts[-1].sql == 'GRANT SELECT ON "my/table" TO U'
+    assert arts[-1].sql == 'GRANT SELECT ON "my/table" TO USER U'
 
 
 def test_collections_filter_system_and_split_functions():
@@ -112,12 +114,13 @@ def test_database_preamble():
         "SET SQL DIALECT 1",
         "-- Default character set: WIN1251",
         "COMMENT ON DATABASE IS 'Main DB'",
-        "GRANT CREATE TABLE TO U",
+        "GRANT CREATE TABLE TO USER U",
     ]
 
 
 def test_registry_and_aliases():
     assert categories.CATEGORY_BY_ALIAS["udf"].key == "external_function"
+    assert categories.CATEGORY_BY_ALIAS["external_function"].key == "external_function"   # keys are aliases too
     assert categories.CATEGORY_BY_ALIAS["proc"].key == "procedure"
     assert categories.CATEGORY_BY_ALIAS["sequence"].key == "generator"
     assert "grant" not in categories.TYPE_CHOICES and "comment" not in categories.TYPE_CHOICES

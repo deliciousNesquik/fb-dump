@@ -32,6 +32,7 @@ def _schema_kw(**extra):
     ["--allow-partial", "--list"],
     ["--force"],
     ["--type", "zzz", "ACCOUNT"],
+    ["-q", "-v", "--list"],
 ])
 def test_usage_errors_exit_2(argv):
     with pytest.raises(SystemExit) as e:
@@ -67,7 +68,7 @@ def test_run_full_writes_complete_tree(tmp_path):
     code = cli.run_full(_ctx(**_schema_kw()), out, allow_partial=False, force=False)
     assert code == 0
     assert (out / "DATABASE.sql").read_text(encoding="utf-8").startswith("SET SQL DIALECT 3;")
-    assert (out / "07_TABLES/ACCOUNT.sql").read_text(encoding="utf-8") == "CREATE OBJ ACCOUNT;\n\nGRANT SELECT ON ACCOUNT TO U;\n"
+    assert (out / "07_TABLES/ACCOUNT.sql").read_text(encoding="utf-8") == "CREATE OBJ ACCOUNT;\n\nGRANT SELECT ON ACCOUNT TO USER U;\n"
     assert (out / "11_PROCEDURES/CALC.sql").exists() and (out / "01_ROLES/R.sql").exists()
     assert (out / MANIFEST).exists()
     assert not (out / "13_TRIGGERS").exists()          # empty categories create no directories

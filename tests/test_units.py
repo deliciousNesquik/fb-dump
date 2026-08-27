@@ -48,11 +48,13 @@ def test_collation_exception_domain_function():
     assert _sql(ctx, "collation", FObj("C", description="c")) == [
         ("COLLATIONS/C.sql", "CREATE OBJ C", False), ("COLLATIONS/C.sql", "COMMENT ON C IS 'c'", False)]
     assert _sql(ctx, "exception", FObj("E")) == [
-        ("EXCEPTIONS/E.sql", "CREATE OR ALTER OBJ E", False), ("EXCEPTIONS/E.sql", "GRANT USAGE ON EXCEPTION E TO U", False)]
+        ("EXCEPTIONS/E.sql", "CREATE OR ALTER OBJ E\nRETURNS INTEGER\nAS\nBEGIN END", False),
+        ("EXCEPTIONS/E.sql", "GRANT USAGE ON EXCEPTION E TO USER U", False)]
     assert _sql(ctx, "domain", FObj("D", description="d")) == [
         ("DOMAINS/D.sql", "CREATE OBJ D", False), ("DOMAINS/D.sql", "COMMENT ON D IS 'd'", False)]
     assert _sql(ctx, "function", FObj("F")) == [
-        ("FUNCTIONS/F.sql", "CREATE OR ALTER OBJ F", True), ("FUNCTIONS/F.sql", "GRANT EXECUTE ON FUNCTION F TO U", False)]
+        ("FUNCTIONS/F.sql", "CREATE OR ALTER OBJ F\nRETURNS INTEGER\nAS\nBEGIN END", True),
+        ("FUNCTIONS/F.sql", "GRANT EXECUTE ON FUNCTION F TO USER U", False)]
 
 
 def test_preamble_without_charset_and_with_unknown_ddl_grant(capsys):
@@ -96,7 +98,7 @@ def test_run_full_logs_unmapped_privileges(capsys):
         assert cli.run_full(ctx, None, allow_partial=False, force=False) == 0
     finally:
         log.set_level(log.NORMAL)
-    assert "outside the dump were ignored" in capsys.readouterr().err
+    assert "unknown subject types were ignored" in capsys.readouterr().err
 
 
 def _fake_driver(monkeypatch, schema, close_raises=False, with_fallback=False):
