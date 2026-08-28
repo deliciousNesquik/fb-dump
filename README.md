@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Releases](https://img.shields.io/github/v/release/deliciousNesquik/fb-dump?sort=semver)](https://github.com/deliciousNesquik/fb-dump/releases)
 [![Firebird 3/4/5](https://img.shields.io/badge/Firebird-3%20%7C%204%20%7C%205-orange)](https://firebirdsql.org/)
+[![Status Terrid][status-terrid]][andivionian-status-classifier]
 
 `fb-dump` reads the schema of a live **Firebird** database and writes it as a tree of `.sql` files — **one object, one file**, where the file contains the *complete* definition of the object: DDL, constraints, comments, and grants.
 
@@ -278,3 +279,6 @@ Tests run on fakes of firebird-lib objects — neither a database nor `fbclient`
 ## License
 
 [MIT](LICENSE)
+
+[andivionian-status-classifier]: https://andivionian.fornever.me/v1/#status-terrid-
+[status-terrid]: https://img.shields.io/badge/status-terrid-green.svg
