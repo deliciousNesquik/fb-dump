@@ -253,7 +253,7 @@ The tree is a *description*; turning it back into a database is a separate task.
 1. **Cross-object dependencies within a single category** — a view built on another view, a procedure calling another procedure, a foreign key pointing at a table that sorts later alphabetically. Numbered directories only order *categories*.
 2. **Grants to PSQL objects** (`GRANT … TO PROCEDURE P`) require the grantee to exist.
 
-Concatenating files in directory order (`fb-dump -d DSN > all.sql` does exactly this) works for schemas without such cycles; in the general case, use a script that applies files in dependency order (or in multiple passes) — this is what a separate *applier* tool is for. Definitions use `CREATE OR ALTER` / `RECREATE` where Firebird supports it, so reapplying a file is harmless.
+Concatenating files in directory order (`fb-dump -d DSN > all.sql` does exactly this) gives a readable single-file view of the schema, but it is not a reliable way to build a database. A foreign key only has to reference a table that sorts later — in one real 1,014-table schema, 627 of them do — and the script stops there. Recreating a database is the job of an *applier* that works in phases: domains and generators, then tables without constraints, then constraints, then indices, then views and PSQL in repeated passes until a pass adds nothing new, and finally grants and comments. Definitions use `CREATE OR ALTER` / `RECREATE` where Firebird supports it, so reapplying a file is harmless — which is what makes the repeated passes safe.
 
 ## Limitations
 
