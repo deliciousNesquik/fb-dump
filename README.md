@@ -21,6 +21,7 @@ The tool does one thing. It reads the system catalog via [`firebird-lib`](https:
 - [Directory layout and file names](#directory-layout-and-file-names)
 - [Guarantees](#guarantees)
 - [Exit codes](#exit-codes)
+- [Isolation](#isolation)
 - [Character sets](#character-sets)
 - [Recreating a schema from the tree](#recreating-a-schema-from-the-tree)
 - [Limitations](#limitations)
@@ -87,6 +88,7 @@ Flags take precedence over environment variables. The password is **never** acce
 | `-u`, `--user USER` | `ISC_USER` | driver default | Database user. |
 | — | `ISC_PASSWORD` | — | Password. |
 | `-r`, `--role ROLE` | `FB_ROLE` | — | SQL role to connect with. |
+| `--isolation LEVEL` | `FB_ISOLATION` | `read-committed` | Isolation of the catalog-reading transaction: `read-committed`, `read-consistency` or `snapshot` (see [Isolation](#isolation)). |
 | `--charset CS` | `FB_CHARSET` | `UTF8` | Connection character set (see [Character sets](#character-sets)). |
 | `--fallback-charset CS` | — | — | Second charset for mixed-encoding metadata. |
 
@@ -211,7 +213,7 @@ Every tree stores its effective layout in **`.fb-dump.toml`**. This file makes t
 - **Read-only.** fb-dump only ever reads the database catalog; it never writes to the database.
 - **Object-level resilience.** A single object that fails to render (no permissions, strange metadata) is logged and counted; it never aborts the run. A collection that cannot be read entirely is an infrastructure error (code 1).
 
-Transactions are **read committed, record version, NO WAIT**: fb-dump never waits on a lock. Consequently, a dump is *not* a point-in-time snapshot: DDL committed during the dump may end up in some collections and not in others. Take the dump when the schema is not changing.
+Transactions are **read-only and NO WAIT**: fb-dump never waits on a lock, and never writes to the database. What the run guarantees about consistency depends on `--isolation` — see below.
 
 ## Exit codes
 
@@ -221,6 +223,22 @@ Transactions are **read committed, record version, NO WAIT**: fb-dump never wait
 | `1` | Infrastructure: cannot connect, cannot read a collection, or cannot write the output. |
 | `2` | Usage: bad arguments, bad layout file, no database given. |
 | `3` | Incomplete result: some objects were skipped or (in targeted mode) some names were not found. In a full dump, nothing is written unless `--allow-partial` is specified. |
+
+## Isolation
+
+The catalog is read in one read-only transaction that never waits on a lock. What that transaction guarantees is your choice:
+
+| `--isolation` | What you get | What it costs |
+| --- | --- | --- |
+| `read-committed` (default) | Record-version read committed. | The dump is **not** a point-in-time snapshot: DDL committed while it runs may land in one collection and not in another. |
+| `read-consistency` (Firebird 4+) | Read committed where every statement sees a stable view. firebird-lib loads a collection with one query, so each collection is internally consistent. | Different collections still come from different moments. Rejected with a clear message on Firebird 3. |
+| `snapshot` | One consistent view of the catalog for the whole run, so the tree is a true snapshot of the schema as of its start. | Record versions cannot be garbage-collected while the dump runs. On a large dump against a busy database, that defers cleanup for the duration. |
+
+Firebird's `SNAPSHOT` is *concurrency* isolation — pure MVCC that blocks neither readers nor writers. The level that does take table locks is `SNAPSHOT TABLE STABILITY`, and fb-dump never uses it.
+
+Two levels the driver offers are deliberately absent. `SNAPSHOT TABLE STABILITY` (`SERIALIZABLE` in the driver) takes table locks and would block every writer touching the same system tables — the opposite of what a dumper should do. Read committed *without* record version fails on the first record another transaction is modifying, which under `NO WAIT` is a spurious error with nothing gained.
+
+A dump of a 13,000-object schema takes about two minutes here, so `snapshot` is usually the better choice; `read-committed` remains the default because it is the safer neighbour on a busy OLTP server. `--fallback-charset` reads its collection through a second connection, hence in a second transaction — with `snapshot` that part is consistent in itself but not with the primary connection's view.
 
 ## Character sets
 
@@ -240,7 +258,7 @@ Concatenating files in directory order (`fb-dump -d DSN > all.sql` does exactly 
 ## Limitations
 
 - Not byte-identical to `isql -x`: firebird-lib formats DDL differently (semantically equivalent).
-- No point-in-time snapshot (see [Guarantees](#guarantees)).
+- A dump is a point-in-time snapshot only with `--isolation snapshot` (see [Isolation](#isolation)).
 - Comments on function *parameters* are not dumped (firebird-lib does not provide `COMMENT ON` for them); procedure parameters, columns, and comments on all objects are dumped.
 - `SQL SECURITY DEFINER|INVOKER` (Firebird 4) is dumped for tables only; firebird-lib does not read it for procedures, functions, triggers and packages. Role system privileges (`ALTER ROLE … SET SYSTEM PRIVILEGES`) are not dumped either.
 - Shadows, BLOB filters, users, and mappings are not the schema objects that fb-dump knows about.
