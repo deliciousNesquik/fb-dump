@@ -198,7 +198,8 @@ def _fake_driver(monkeypatch, schema):
 
     monkeypatch.setenv("FB_DATABASE", "fake")
     monkeypatch.setattr(cli.db, "connect", lambda settings, charset=None: _Con())
-    monkeypatch.setattr(cli.db, "open_schema", lambda settings, con: schema)
+    monkeypatch.setattr(cli.db, "open_schema",
+                        lambda settings, con: (cli.db.set_isolation(settings.isolation), schema)[1])
     monkeypatch.setattr(cli.db, "dialect", lambda con: 3)
 
 
@@ -269,3 +270,22 @@ def test_target_is_checked_before_connecting(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli.db, "connect", lambda settings, charset=None: type("C", (), {"close": lambda self: None})())
     assert cli.main(["A", "-o", str(tree)]) == 0
     assert (tree / ".git").exists()
+
+
+def test_isolation_reaches_the_driver_end_to_end(monkeypatch, capsys):
+    """--isolation must be applied before the schema binds its read transaction."""
+    applied: list[str] = []
+    monkeypatch.setattr(cli.db, "set_isolation", lambda name: applied.append(name))
+    _fake_driver(monkeypatch, FSchema(tables=[FObj("A")]))
+    assert cli.main(["--list", "--isolation", "snapshot", "-v"]) == 0
+    assert applied == ["snapshot"]
+    assert "isolation=snapshot" in capsys.readouterr().err
+
+    assert cli.main(["--list"]) == 0
+    assert applied[-1] == "read-committed"
+
+
+def test_unknown_isolation_is_a_usage_error():
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--list", "--isolation", "serializable"])
+    assert e.value.code == 2

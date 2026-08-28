@@ -171,11 +171,11 @@ def test_connect_passes_only_given_credentials(monkeypatch):
 
     monkeypatch.setattr(db, "_connect", fake_connect)
     from fb_dump.config import Settings
-    s = Settings(database="host:db", user=None, password=None, role=None, charset="UTF8", fallback_charset="WIN1251")
+    s = Settings(database="host:db", user=None, password=None, role=None, charset="UTF8", fallback_charset="WIN1251", isolation="read-committed")
     assert db.connect(s) == "CON" and calls["kw"] == {"charset": "UTF8"}
     db.connect(s, charset="WIN1251")
     assert calls["kw"] == {"charset": "WIN1251"}
-    s2 = Settings(database="db", user="U", password="P", role="R", charset="UTF8", fallback_charset=None)
+    s2 = Settings(database="db", user="U", password="P", role="R", charset="UTF8", fallback_charset=None, isolation="read-committed")
     db.connect(s2)
     assert calls["kw"] == {"charset": "UTF8", "user": "U", "password": "P", "role": "R"}
 
@@ -199,6 +199,7 @@ def test_nowait_tpb_forces_lock_timeout_zero(monkeypatch):
         return b"tpb"
 
     monkeypatch.setattr(db, "_driver_tpb", fake_tpb)
+    db.set_isolation(None)                     # no --isolation: pass the library's own choice through
     assert db._nowait_tpb("ISO", lock_timeout=-1, access_mode="READ") == b"tpb"
     assert seen == {"isolation": "ISO", "lock_timeout": 0, "access_mode": "READ"}
     import firebird.lib.schema as fbs
