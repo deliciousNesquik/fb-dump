@@ -15,7 +15,15 @@ ENV_CHARSET = "FB_CHARSET"
 ENV_USER = "ISC_USER"
 ENV_PASSWORD = "ISC_PASSWORD"
 ENV_ROLE = "FB_ROLE"
+ENV_ISOLATION = "FB_ISOLATION"
 DEFAULT_CHARSET = "UTF8"
+
+# Transaction isolation for reading the catalog. All are read-only and NO WAIT; they
+# differ in what they guarantee and what they cost (see db.py and the README). Levels
+# that would block writers (SNAPSHOT TABLE STABILITY) or fail on any record being
+# modified (read committed without record version) are deliberately not offered.
+ISOLATIONS = ("read-committed", "read-consistency", "snapshot")
+DEFAULT_ISOLATION = "read-committed"
 
 
 class ConfigError(Exception):
@@ -30,6 +38,7 @@ class Settings:
     role: str | None
     charset: str
     fallback_charset: str | None
+    isolation: str
 
 
 def _norm_charset(value: str) -> str:
@@ -38,7 +47,7 @@ def _norm_charset(value: str) -> str:
 
 def resolve(env: Mapping[str, str], *, database: str | None = None, user: str | None = None,
             role: str | None = None, charset: str | None = None,
-            fallback_charset: str | None = None) -> Settings:
+            fallback_charset: str | None = None, isolation: str | None = None) -> Settings:
     db = database or env.get(ENV_DATABASE) or ""
     if not db.strip():
         raise ConfigError(f"no database given: use --database or set {ENV_DATABASE}")
@@ -46,6 +55,9 @@ def resolve(env: Mapping[str, str], *, database: str | None = None, user: str | 
     fb = _norm_charset(fallback_charset) if fallback_charset else None
     if fb is not None and fb == cs:
         raise ConfigError("--fallback-charset must differ from --charset")
+    iso = (isolation or env.get(ENV_ISOLATION) or DEFAULT_ISOLATION).strip().lower()
+    if iso not in ISOLATIONS:
+        raise ConfigError(f"unknown isolation {iso!r}; choose from {', '.join(ISOLATIONS)}")
     return Settings(
         database=db.strip(),
         user=(user or env.get(ENV_USER) or None),
@@ -53,4 +65,5 @@ def resolve(env: Mapping[str, str], *, database: str | None = None, user: str | 
         role=(role or env.get(ENV_ROLE) or None),
         charset=cs,
         fallback_charset=fb,
+        isolation=iso,
     )

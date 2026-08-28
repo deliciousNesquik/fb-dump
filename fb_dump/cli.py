@@ -51,6 +51,11 @@ def _build_parser() -> argparse.ArgumentParser:
     conn.add_argument("-r", "--role", metavar="ROLE", help=f"SQL role to connect with [env {config.ENV_ROLE}]")
     conn.add_argument("--charset", metavar="CHARSET",
                       help=f"connection character set [env {config.ENV_CHARSET}, default {config.DEFAULT_CHARSET}]")
+    conn.add_argument("--isolation", choices=config.ISOLATIONS, metavar="LEVEL",
+                      help=f"transaction isolation for reading the catalog: {' | '.join(config.ISOLATIONS)} "
+                           f"[env {config.ENV_ISOLATION}, default {config.DEFAULT_ISOLATION}]; snapshot gives one "
+                           f"consistent view of the schema, read-consistency (Firebird 4+) gives it per collection. "
+                           f"All are read-only and never wait on a lock")
     conn.add_argument("--fallback-charset", metavar="CHARSET",
                       help="re-read a metadata collection through a second connection with this "
                            "charset when the primary one fails to decode it (mixed-encoding legacy databases)")
@@ -247,7 +252,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         settings = config.resolve(os.environ, database=args.database, user=args.user, role=args.role,
-                                  charset=args.charset, fallback_charset=args.fallback_charset)
+                                  charset=args.charset, fallback_charset=args.fallback_charset,
+                                  isolation=args.isolation)
     except config.ConfigError as exc:
         log.error(str(exc))
         return EXIT_USAGE
@@ -262,12 +268,13 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_INFRA
 
     log.debug(f"database={settings.database} user={settings.user or '(driver default)'} "
-              f"role={settings.role or '-'} charset={settings.charset} fallback={settings.fallback_charset or '-'}")
+              f"role={settings.role or '-'} charset={settings.charset} fallback={settings.fallback_charset or '-'} "
+              f"isolation={settings.isolation}")
 
     con: Any = None
     schema: Any = None
     try:
-        log.info("Connecting (read committed, record version, NO WAIT)...")
+        log.info(f"Connecting ({settings.isolation}, read-only, NO WAIT)...")
         con = db.connect(settings)
         schema = db.open_schema(settings, con)
         ctx = Context(schema, lay, db.dialect(con))

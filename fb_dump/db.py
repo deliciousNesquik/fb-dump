@@ -8,12 +8,30 @@ driver default ``lock_timeout=-1`` (WAIT). The ``tpb`` symbol the schema module
 resolves is replaced here so that transaction is always built with
 ``lock_timeout=0`` (NO WAIT), keeping its isolation and access mode.
 
-Known trade-offs, deliberately accepted:
+``--isolation`` picks what that transaction guarantees:
 
-* Both patches below are process-global and happen at import time; fb-dump is a
-  CLI, and ``Schema.bind()`` offers no hook for its transaction.
-* READ COMMITTED means the dump is not a point-in-time snapshot: DDL committed
-  while the dump runs may show up in some collections and not in others.
+* ``read-committed`` (default) — read committed + record version. The dump is
+  *not* a point-in-time snapshot: DDL committed while it runs may show up in one
+  collection and not in another. In exchange, a read-only read-committed
+  transaction does not hold back garbage collection.
+* ``read-consistency`` (Firebird 4+) — read committed, but every statement sees a
+  stable view. firebird-lib loads a collection with one query, so each collection
+  is internally consistent while garbage collection is held back only per
+  statement, not for the whole run.
+* ``snapshot`` — one consistent view of the catalog for the whole run. Firebird's
+  SNAPSHOT (concurrency) is pure MVCC: it blocks neither readers nor writers
+  (that is SNAPSHOT TABLE STABILITY, a different level). The cost is that record
+  versions cannot be collected while the dump runs.
+
+Two levels the driver offers are deliberately not exposed: SNAPSHOT TABLE STABILITY
+(``SERIALIZABLE`` in the driver) takes table locks and would block every writer
+touching the same system tables, and read committed *without* record version fails
+on the first record another transaction is modifying — under NO WAIT that is a
+spurious error with nothing gained.
+
+Known trade-offs, deliberately accepted: the patches below are process-global and
+happen at import time; fb-dump is a CLI, and ``Schema.bind()`` offers no hook for
+its transaction.
 """
 
 from __future__ import annotations
@@ -21,6 +39,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import firebird.lib.schema as _fb_schema
+from firebird.driver import Isolation
 from firebird.lib.schema import COLUMN_TYPES, INTEGRAL_SUBTYPES, Domain, FieldSubType, FieldType, SchemaItem
 from firebird.driver import TraAccessMode, driver_config
 from firebird.driver import connect as _connect
@@ -30,8 +49,31 @@ from . import log
 from .config import Settings
 
 
+# Isolation requested on the command line; None keeps whatever the caller asked for.
+_ISOLATION: Isolation | None = None
+
+_ISOLATIONS: dict[str, Isolation] = {
+    "read-committed": Isolation.READ_COMMITTED_RECORD_VERSION,
+    "read-consistency": Isolation.READ_COMMITTED_READ_CONSISTENCY,   # Firebird 4+
+    "snapshot": Isolation.SNAPSHOT,
+}
+_MIN_ENGINE: dict[str, float] = {"read-consistency": 4.0}
+
+
+def set_isolation(name: str | None) -> None:
+    """Choose the isolation of the transaction firebird-lib opens for the catalog."""
+    global _ISOLATION
+    if name is None:
+        _ISOLATION = None
+        return
+    try:
+        _ISOLATION = _ISOLATIONS[name]
+    except KeyError:
+        raise ValueError(f"unknown isolation {name!r}") from None
+
+
 def _nowait_tpb(isolation, lock_timeout: int = -1, access_mode=TraAccessMode.WRITE) -> bytes:  # noqa: ANN001, ARG001
-    return _driver_tpb(isolation, lock_timeout=0, access_mode=access_mode)
+    return _driver_tpb(_ISOLATION or isolation, lock_timeout=0, access_mode=access_mode)
 
 
 _fb_schema.tpb = _nowait_tpb
@@ -165,7 +207,16 @@ class ResilientSchema:
 
 
 def open_schema(settings: Settings, con: Any) -> Any:
-    """``con.schema``, wrapped in ``ResilientSchema`` when a fallback charset is configured."""
+    """``con.schema``, wrapped in ``ResilientSchema`` when a fallback charset is configured.
+
+    The isolation is applied here, before the schema binds its read transaction."""
+    required = _MIN_ENGINE.get(settings.isolation)
+    if required is not None:
+        engine = float(getattr(con.info, "engine_version", 0) or 0)
+        if engine < required:
+            raise RuntimeError(f"--isolation {settings.isolation} needs Firebird {required:.0f}+, "
+                               f"this server reports {engine or 'an unknown version'}")
+    set_isolation(settings.isolation)
     if not settings.fallback_charset:
         return con.schema
     fb = settings.fallback_charset
