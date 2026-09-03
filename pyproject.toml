@@ -1,6 +1,6 @@
 [project]
 name = "fb-dump"
-version = "1.1.0"
+version = "1.2.0"
 description = "Dump a Firebird database schema as one .sql file per object"
 readme = "README.md"
 requires-python = ">=3.11"
