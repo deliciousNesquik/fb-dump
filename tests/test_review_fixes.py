@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 import pytest
-from fakes import FObj, FPriv, FSchema
+from fakes import FChild, FConstraint, FGenerator, FObj, FPriv, FSchema
 
 from fb_dump import cli, db, layout, writer
 from fb_dump.layout import MANIFEST, LayoutError, from_dict, preset
@@ -289,3 +289,86 @@ def test_unknown_isolation_is_a_usage_error():
     with pytest.raises(SystemExit) as e:
         cli.main(["--list", "--isolation", "serializable"])
     assert e.value.code == 2
+
+
+# ------------------------------------------------- Change A: ordered script
+
+def test_phase_order_covers_every_emission_site():
+    """Every artifact a category can emit must carry a deliberate phase."""
+    from fb_dump.model import Phase
+    ctx = Context(FSchema(privileges=[FPriv("U", "S", "T"), FPriv("U", "S", "V"),
+                                      FPriv("U", "M", "R", subject_type=13)]),
+                  preset("numbered"), dialect=3)
+    seen: dict[str, set[Phase]] = {}
+    objects = {
+        "role": FObj("R", description="d"), "collation": FObj("C", description="d"),
+        "external_function": FObj("F", external=True, description="d"),
+        "generator": FObj("G", increment=5, description="d"), "exception": FObj("E", description="d"),
+        "domain": FObj("D", description="d"),
+        "table": FObj("T", description="d", attributes={"RDB$RELATION_TYPE": 4, "RDB$SQL_SECURITY": True},
+                      columns=[FChild("ID", "c", identity=0, generator=FGenerator(increment=2))],
+                      constraints=[FConstraint("PK", "pkey", ["A"]), FConstraint("U1", "unique", ["B"]),
+                                   FConstraint("CK", "check"), FConstraint("FK", "fkey", ["C"], ["D"])]),
+        "index": FObj("IX", inactive=True, description="d"), "function": FObj("FN", description="d"),
+        "view": FObj("V", description="d"), "procedure": FObj("P", description="d"),
+        "package": FObj("K", body="x", description="d"), "trigger": FObj("TR", description="d"),
+    }
+    for key, obj in objects.items():
+        seen[key] = {a.phase for a in cli.categories.CATEGORY_BY_KEY[key].emit(ctx, obj, stub=True)}
+
+    assert seen["role"] == {Phase.ROLE, Phase.COMMENT, Phase.GRANT}
+    assert seen["domain"] == {Phase.DOMAIN, Phase.COMMENT}
+    assert seen["table"] >= {Phase.TABLE, Phase.TABLE_ALTER, Phase.KEY, Phase.CHECK, Phase.FOREIGN_KEY}
+    assert seen["index"] == {Phase.INDEX, Phase.INDEX_STATE, Phase.COMMENT}
+    assert Phase.ROUTINE_STUB in seen["function"] and Phase.ROUTINE in seen["function"]
+    assert Phase.ROUTINE_STUB in seen["procedure"] and Phase.ROUTINE in seen["procedure"]
+    assert seen["package"] >= {Phase.ROUTINE_STUB, Phase.ROUTINE}     # header is the stub
+    assert seen["view"] == {Phase.VIEW, Phase.COMMENT, Phase.GRANT}
+    assert seen["trigger"] == {Phase.TRIGGER, Phase.COMMENT}
+
+
+def test_ddl_and_database_triggers_come_after_plain_ones():
+    from fb_dump.model import Phase
+    ctx = Context(FSchema(), preset("numbered"), dialect=3)
+    cat = cli.categories.CATEGORY_BY_KEY["trigger"]
+    dml = cat.emit(ctx, FObj("T"))[0]
+    ddl = cat.emit(ctx, FObj("D", ddl=True, attributes={"RDB$TRIGGER_TYPE": 16384 | (1 << 3)}))[0]
+    assert dml.phase is Phase.TRIGGER and ddl.phase is Phase.TRIGGER_DDL
+    assert ddl.phase > dml.phase
+
+
+def test_stub_only_appears_when_asked_and_never_for_udr():
+    from fb_dump.model import Phase
+    ctx = Context(FSchema(), preset("numbered"), dialect=3)
+    cat = cli.categories.CATEGORY_BY_KEY["procedure"]
+    assert [a.phase for a in cat.emit(ctx, FObj("P"))] == [Phase.ROUTINE]          # tree: no stub
+    stubbed = cat.emit(ctx, FObj("P"), stub=True)
+    assert [a.phase for a in stubbed] == [Phase.ROUTINE_STUB, Phase.ROUTINE]
+    assert stubbed[0].sql.startswith("CREATE OR ALTER") and "BEGIN\nEND" in stubbed[0].sql
+    udr = FObj("U", attributes={"RDB$ENGINE_NAME": "UDR", "RDB$ENTRYPOINT": "x!y"}, source=None)
+    assert [a.phase for a in cat.emit(ctx, udr, stub=True)] == [Phase.ROUTINE]     # nothing to stub
+
+
+def test_write_script_sorts_by_phase_and_is_stable(capsys):
+    from fb_dump.model import Phase
+    arts = [Artifact("a.sql", "GRANT A", phase=Phase.GRANT),
+            Artifact("b.sql", "CREATE TABLE B", phase=Phase.TABLE),
+            Artifact("c.sql", "GRANT B", phase=Phase.GRANT),
+            Artifact("d.sql", "SET SQL DIALECT 3", phase=Phase.DIALECT),
+            Artifact("e.sql", "   ", phase=Phase.TABLE)]
+    assert writer.write_script(arts) == 4                       # blank dropped
+    out = capsys.readouterr().out
+    assert [l for l in out.split("\n") if l.strip()] == [
+        "SET SQL DIALECT 3;", "CREATE TABLE B;", "GRANT A;", "GRANT B;"]   # GRANT A before GRANT B
+
+
+def test_tree_output_untouched_by_phases(tmp_path):
+    """Phases must not change what lands in a file, only the script order."""
+    ctx = Context(FSchema(tables=[FObj("T", description="d",
+                                       constraints=[FConstraint("FK", "fkey"), FConstraint("PK", "pkey")])],
+                          privileges=[FPriv("U", "S", "T")]), preset("numbered"), dialect=3)
+    out = tmp_path / "tree"
+    cli.run_full(ctx, out, allow_partial=False, force=False)
+    assert (out / "07_TABLES/T.sql").read_text(encoding="utf-8") == (
+        "CREATE OBJ T;\n\nALTER TABLE ADD CONSTRAINT PK (pkey);\n\n"
+        "ALTER TABLE ADD CONSTRAINT FK (fkey);\n\nCOMMENT ON T IS 'd';\n\nGRANT SELECT ON T TO USER U;\n")

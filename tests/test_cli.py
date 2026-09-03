@@ -83,11 +83,18 @@ def test_run_full_is_all_or_nothing(tmp_path):
     assert (out / "07_TABLES/ACCOUNT.sql").exists() and not (out / "07_TABLES/BROKEN.sql").exists()
 
 
-def test_run_full_to_stdout(capsys):
+def test_run_full_to_stdout_is_an_ordered_script(capsys):
+    """Without --out the dump is one script, sorted so it can be applied."""
     assert cli.run_full(_ctx(**_schema_kw()), None, allow_partial=False, force=False) == 0
     out = capsys.readouterr().out
-    assert out.startswith("-- ===== DATABASE.sql =====\nSET SQL DIALECT 3;")
-    assert "-- ===== 07_TABLES/ACCOUNT.sql =====" in out
+    assert out.startswith("SET SQL DIALECT 3;")          # dialect first
+    assert "-- ===== " not in out                        # not a per-file listing any more
+    order = [out.index(x) for x in ("CREATE OBJ R",                  # role
+                                    "CREATE OBJ GEN",                # generator
+                                    "CREATE OBJ ACCOUNT",            # table
+                                    "CREATE OR ALTER OBJ CALC",      # routine body
+                                    "GRANT SELECT ON ACCOUNT")]      # grants last
+    assert order == sorted(order), out
 
 
 def test_run_full_respects_layout(tmp_path):
