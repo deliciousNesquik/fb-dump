@@ -24,7 +24,7 @@ The tool does one thing. It reads the system catalog via [`firebird-lib`](https:
 - [Exit codes](#exit-codes)
 - [Isolation](#isolation)
 - [Character sets](#character-sets)
-- [Recreating a schema from the tree](#recreating-a-schema-from-the-tree)
+- [Applying the output](#applying-the-output)
 - [Limitations](#limitations)
 - [Development](#development)
 - [License](#license)
@@ -38,7 +38,7 @@ fb-dump -d localhost:employee -o schema                  # full dump into ./sche
 fb-dump -d localhost:employee --list                     # what is inside?
 fb-dump -d localhost:employee CUSTOMER                   # one object, printed to stdout
 fb-dump -d localhost:employee CUSTOMER -o schema         # ...or refresh the tree
-fb-dump -d localhost:employee > employee.sql             # entire schema as a single script
+fb-dump -d localhost:employee > employee.sql             # one script, ordered so it applies
 ```
 
 A dump looks like this:
@@ -97,7 +97,7 @@ Flags take precedence over environment variables. The password is **never** acce
 
 ## Modes
 
-**Full dump** — no object names. Reads the entire schema and writes a complete tree (`--out`) or prints every file to stdout in directory order, with a `-- ===== path =====` header before each. The tree is replaced entirely and only if every object was read (see [Guarantees](#guarantees)).
+**Full dump** — no object names. Reads the entire schema and either writes a complete tree (`--out`) or prints **one script** to stdout, ordered so that it can be applied against an empty database (see [Applying the output](#applying-the-output)). The tree is replaced entirely and only if every object was read (see [Guarantees](#guarantees)).
 
 ```bash
 fb-dump -d DSN -o schema
@@ -105,7 +105,7 @@ fb-dump -d DSN -o schema --layout plain          # directories without numbers
 fb-dump -d DSN > schema.sql
 ```
 
-**Targeted export** — one or more object names. Names are matched case-insensitively; a name found in multiple categories yields multiple files unless `--type` narrows the selection. Without `--out`, SQL is printed to stdout; with `--out`, only the affected files are overwritten (nothing is deleted — cleaning up obsolete files is the full dump's job). The tool's own tree layout is used.
+**Targeted export** — one or more object names. Names are matched case-insensitively; a name found in multiple categories yields multiple files unless `--type` narrows the selection. Without `--out`, SQL is printed to stdout with a `-- ===== path =====` header per object — a preview of the tree file, not the ordered script; with `--out`, only the affected files are overwritten (nothing is deleted — cleaning up obsolete files is the full dump's job). The tool's own tree layout is used.
 
 ```bash
 fb-dump -d DSN ACCOUNT                        # every ACCOUNT (table, procedure, …)
@@ -247,19 +247,37 @@ The connection is opened with `--charset` (default `UTF8`). Legacy databases who
 
 In some legacy databases, metadata is stored in **mixed** encodings: some rows decode only as WIN1251, while others contain characters outside WIN1251 and decode only as UTF8. A single connection cannot read both, and firebird-lib loads the entire collection with one query, so one bad row fails the whole collection. `--fallback-charset WIN1251` lazily opens a second connection and re-reads such a collection through it; a warning names every collection that took this path. Rows from the fallback connection are read in a different transaction, so the consistency caveat above applies doubly.
 
-## Recreating a schema from the tree
+## Applying the output
 
-The tree is a *description*; turning it back into a database is a separate task. Two things require ordering that files alone cannot express:
+**The single script applies; the tree does not concatenate.** These are two different artifacts.
 
-1. **Cross-object dependencies within a single category** — a view built on another view, a procedure calling another procedure, a foreign key pointing at a table that sorts later alphabetically. Numbered directories only order *categories*.
-2. **Grants to PSQL objects** (`GRANT … TO PROCEDURE P`) require the grantee to exist.
+```bash
+fb-dump -d DSN > schema.sql
+isql -user SYSDBA -password ... -i schema.sql newdb.fdb
+```
 
-Concatenating files in directory order (`fb-dump -d DSN > all.sql` does exactly this) gives a readable single-file view of the schema, but it is not a reliable way to build a database. A foreign key only has to reference a table that sorts later — in one real 1,014-table schema, 627 of them do — and the script stops there. Recreating a database is the job of an *applier* that works in phases: domains and generators, then tables without constraints, then constraints, then indices, then views and PSQL in repeated passes until a pass adds nothing new, and finally grants and comments. Definitions use `CREATE OR ALTER` / `RECREATE` where Firebird supports it, so reapplying a file is harmless — which is what makes the repeated passes safe.
+Without `--out`, statements are not grouped per object — they are sorted into phases, so that nothing references an object that does not exist yet:
+
+dialect · roles · collations · character sets · external functions · generators · exceptions · domains · tables (no constraints) · identity and `SQL SECURITY` · primary keys and unique · checks · foreign keys · indices · **routine headers** · views · **routine bodies** · DML triggers · DDL and database triggers · comments · grants
+
+Two of those deserve a note. Every procedure and function is created **twice**: first as a header with an empty body, then with its real body. That is what makes call order irrelevant — when a body is compiled, everything it calls already exists, including mutually recursive routines. And DDL or database triggers come last on purpose: created earlier, they would fire on every statement that follows, which for an audit trigger means logging the entire restore.
+
+Grants sit at the end because a grantee may be a role, a user, or a PSQL object — 44% of grants in one real schema name a trigger or a procedure.
+
+**The tree is a description, not a migration.** Concatenating its files (in any order) is not a way to build a database: a table's file carries its own foreign keys, so it references tables that may not exist yet. Applying a *tree* — and applying only part of one — is the job of a separate tool.
+
+Known limits of the script, both from the same cause (fb-dump reads no dependency graph):
+
+- a computed column that selects from another table may be created before that table — in one real 1,014-table schema, one column does this;
+- a view built on another view is emitted alphabetically, so it may precede its source. Views select from views in none of the schemas measured so far, but nothing prevents it.
+
+Everything is emitted with `CREATE OR ALTER` / `RECREATE` where Firebird supports it, so re-running the script over an existing database is harmless.
 
 ## Limitations
 
 - Not byte-identical to `isql -x`: firebird-lib formats DDL differently (semantically equivalent).
 - A dump is a point-in-time snapshot only with `--isolation snapshot` (see [Isolation](#isolation)).
+- The single script is ordered by statement kind, not by a dependency graph — see [Applying the output](#applying-the-output) for the two cases that need manual ordering.
 - Comments on function *parameters* are not dumped (firebird-lib does not provide `COMMENT ON` for them); procedure parameters, columns, and comments on all objects are dumped.
 - `SQL SECURITY DEFINER|INVOKER` (Firebird 4) is dumped for tables only; firebird-lib does not read it for procedures, functions, triggers and packages. Role system privileges (`ALTER ROLE … SET SYSTEM PRIVILEGES`) are not dumped either.
 - Shadows, BLOB filters, users, and mappings are not the schema objects that fb-dump knows about.
