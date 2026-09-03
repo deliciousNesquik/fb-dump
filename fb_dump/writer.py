@@ -11,6 +11,8 @@ renders each file and writes it. Three operations:
   file is ever visible under the target's name.
 * ``update_tree``  — targeted export: overwrite only the affected files.
 * ``write_stdout`` — print every file with a ``-- ===== path =====`` header.
+* ``write_script`` — print everything as one script ordered so it can be applied:
+  statements are sorted by :class:`~fb_dump.model.Phase`, not grouped per object.
 
 A tree written by fb-dump carries ``.fb-dump.toml`` (its layout). That file is
 also the safety marker: a non-empty directory without it is not ours and is not
@@ -29,7 +31,7 @@ from typing import Iterable, TextIO
 
 from . import log
 from .layout import MANIFEST, LayoutError, load_manifest
-from .model import Artifact
+from .model import Artifact, Phase
 from .render import Statement, render
 
 Grouped = dict[str, list[Statement]]
@@ -60,6 +62,19 @@ def write_stdout(grouped: Grouped, stream: TextIO | None = None) -> int:
 # ------------------------------------------------------------------ helpers
 def _is_foreign(out_dir: Path) -> bool:
     return out_dir.is_dir() and any(out_dir.iterdir()) and not (out_dir / MANIFEST).exists()
+
+
+def write_script(artifacts: Iterable[Artifact], stream: TextIO | None = None) -> int:
+    """Print one script whose statement order can be executed against an empty database.
+
+    Sorting is stable within a phase, so objects keep the order they were read in
+    (categories, then names). Returns the number of statements written."""
+    out = stream or sys.stdout
+    items = [a for a in artifacts if a.sql and a.sql.strip()]
+    items.sort(key=lambda a: a.phase)          # list.sort is stable
+    text = render([(a.sql, a.psql) for a in items])
+    print(text, file=out)
+    return len(items)
 
 
 def _check_target(out_dir: Path, force: bool) -> None:

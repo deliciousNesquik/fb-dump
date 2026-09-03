@@ -23,7 +23,7 @@ from firebird.lib.schema import escape_single_quotes
 from . import log
 from .grants import IsKeyword, quote_ident, render_database_grants, render_grants
 from .layout import CATEGORY_KEYS
-from .model import Artifact, Context
+from .model import Artifact, Context, Phase
 
 Producer = Callable[[Context, Any, str], Iterator[Artifact]]
 
@@ -52,10 +52,18 @@ class Category:
     objects: Callable[[Any], Iterable[Any]]             # user objects of this kind (system ones filtered)
     artifacts_for: Producer                             # (ctx, obj, path) -> statements of the object's file
     name_of: Callable[[Any], str] = field(default=lambda o: o.name)
+    stubbable: bool = False                             # a routine whose header can be created before its body
 
-    def emit(self, ctx: Context, obj: Any) -> list[Artifact]:
+    def emit(self, ctx: Context, obj: Any, *, stub: bool = False) -> list[Artifact]:
+        """Statements of the object's file. ``stub`` additionally prepends a
+        header-with-empty-body statement — used only by the single-script output,
+        where it lets routines be created in any order (see ``Phase``)."""
         path = ctx.layout.path_for(self.key, self.name_of(obj))
-        return list(self.artifacts_for(ctx, obj, path))
+        out: list[Artifact] = []
+        if stub and self.stubbable and _external_routine(obj) is None:
+            out.append(Artifact(path, _routine_stub(obj), psql=True, phase=Phase.ROUTINE_STUB))
+        out += list(self.artifacts_for(ctx, obj, path))
+        return out
 
 
 # ---------------------------------------------------------------- collections
@@ -101,9 +109,9 @@ def _grants(ctx: Context, namespace: str, obj: Any) -> list[str]:
                          owner=getattr(obj, "owner_name", None), is_keyword=ctx.is_keyword)
 
 
-def _plain_stmts(path: str, stmts: Iterable[str]) -> Iterator[Artifact]:
+def _plain_stmts(path: str, stmts: Iterable[str], phase: Phase) -> Iterator[Artifact]:
     for s in stmts:
-        yield Artifact(path, s)
+        yield Artifact(path, s, phase=phase)
 
 
 def _quote_segments(sql: str, names: Iterable[str], is_keyword: IsKeyword) -> str:
@@ -127,6 +135,15 @@ def _external_clause(engine: str, entrypoint: str) -> str:
     return f"EXTERNAL NAME '{escape_single_quotes(entrypoint)}' ENGINE {engine}"
 
 
+def _routine_stub(obj: Any) -> str:
+    """Header with an empty body: ``CREATE OR ALTER PROCEDURE p (…) RETURNS (…) AS BEGIN END``.
+
+    firebird-lib builds exactly this for its own two-pass script order, so the
+    body it substitutes is the one Firebird accepts for the object kind."""
+    create = obj.get_sql_for("create", no_code=True)
+    return "CREATE OR ALTER" + create[len("CREATE"):]
+
+
 def _routine_header(obj: Any) -> str:
     """``CREATE OR ALTER <kind> name (params) RETURNS …`` without the body."""
     create = obj.get_sql_for("create", no_code=True)
@@ -136,20 +153,20 @@ def _routine_header(obj: Any) -> str:
 
 # ------------------------------------------------------------- per category
 def _role(ctx: Context, r: Any, path: str) -> Iterator[Artifact]:
-    yield Artifact(path, r.get_sql_for("create"))
-    yield from _plain_stmts(path, _comments(r))
-    yield from _plain_stmts(path, _grants(ctx, "role", r))  # memberships: GRANT <role> TO <user>
+    yield Artifact(path, r.get_sql_for("create"), phase=Phase.ROLE)
+    yield from _plain_stmts(path, _comments(r), Phase.COMMENT)
+    yield from _plain_stmts(path, _grants(ctx, "role", r), Phase.GRANT)  # GRANT <role> TO <user>
 
 
 def _collation(ctx: Context, c: Any, path: str) -> Iterator[Artifact]:
-    yield Artifact(path, c.get_sql_for("create"))
-    yield from _plain_stmts(path, _comments(c))
+    yield Artifact(path, c.get_sql_for("create"), phase=Phase.COLLATION)
+    yield from _plain_stmts(path, _comments(c), Phase.COMMENT)
 
 
 def _external_function(ctx: Context, f: Any, path: str) -> Iterator[Artifact]:
-    yield Artifact(path, f.get_sql_for("declare"))
-    yield from _plain_stmts(path, _comments(f))
-    yield from _plain_stmts(path, _grants(ctx, "function", f))
+    yield Artifact(path, f.get_sql_for("declare"), phase=Phase.UDF)
+    yield from _plain_stmts(path, _comments(f), Phase.COMMENT)
+    yield from _plain_stmts(path, _grants(ctx, "function", f), Phase.GRANT)
 
 
 def _generator(ctx: Context, g: Any, path: str) -> Iterator[Artifact]:
@@ -162,20 +179,20 @@ def _generator(ctx: Context, g: Any, path: str) -> Iterator[Artifact]:
         params["value"] = start
     if increment not in (None, 0, 1):
         params["increment"] = increment
-    yield Artifact(path, g.get_sql_for("create", **params))
-    yield from _plain_stmts(path, _comments(g))
-    yield from _plain_stmts(path, _grants(ctx, "generator", g))
+    yield Artifact(path, g.get_sql_for("create", **params), phase=Phase.GENERATOR)
+    yield from _plain_stmts(path, _comments(g), Phase.COMMENT)
+    yield from _plain_stmts(path, _grants(ctx, "generator", g), Phase.GRANT)
 
 
 def _exception(ctx: Context, e: Any, path: str) -> Iterator[Artifact]:
-    yield Artifact(path, e.get_sql_for("create_or_alter"))
-    yield from _plain_stmts(path, _comments(e))
-    yield from _plain_stmts(path, _grants(ctx, "exception", e))
+    yield Artifact(path, e.get_sql_for("create_or_alter"), phase=Phase.EXCEPTION)
+    yield from _plain_stmts(path, _comments(e), Phase.COMMENT)
+    yield from _plain_stmts(path, _grants(ctx, "exception", e), Phase.GRANT)
 
 
 def _domain(ctx: Context, d: Any, path: str) -> Iterator[Artifact]:
-    yield Artifact(path, d.get_sql_for("create"))
-    yield from _plain_stmts(path, _comments(d))
+    yield Artifact(path, d.get_sql_for("create"), phase=Phase.DOMAIN)
+    yield from _plain_stmts(path, _comments(d), Phase.COMMENT)
 
 
 def _table(ctx: Context, t: Any, path: str) -> Iterator[Artifact]:
@@ -188,30 +205,33 @@ def _table(ctx: Context, t: Any, path: str) -> Iterator[Artifact]:
         create += "\nON COMMIT PRESERVE ROWS"
     elif relation_type == _RELATION_GTT_DELETE:
         create += "\nON COMMIT DELETE ROWS"
-    yield Artifact(path, create)
+    yield Artifact(path, create, phase=Phase.TABLE)
 
     tname = t.get_quoted_name()
     for col in t.columns:
         # firebird-lib always writes GENERATED BY DEFAULT and never the increment.
         if getattr(col, "is_identity", lambda: False)():
             if _attr(col, "RDB$IDENTITY_TYPE") == _IDENTITY_ALWAYS:
-                yield Artifact(path, f"ALTER TABLE {tname} ALTER COLUMN {col.get_quoted_name()} SET GENERATED ALWAYS")
+                yield Artifact(path, f"ALTER TABLE {tname} ALTER COLUMN {col.get_quoted_name()} SET GENERATED ALWAYS",
+                              phase=Phase.TABLE_ALTER)
             gen = getattr(col, "generator", None)
             increment = getattr(gen, "increment", None)
             if increment not in (None, 0, 1):
-                yield Artifact(path, f"ALTER TABLE {tname} ALTER COLUMN {col.get_quoted_name()} SET INCREMENT BY {increment}")
+                yield Artifact(path, f"ALTER TABLE {tname} ALTER COLUMN {col.get_quoted_name()} SET INCREMENT BY {increment}",
+                              phase=Phase.TABLE_ALTER)
     security = _attr(t, "RDB$SQL_SECURITY")
     if security is not None:
-        yield Artifact(path, f"ALTER TABLE {tname} ALTER SQL SECURITY {'DEFINER' if security else 'INVOKER'}")
+        yield Artifact(path, f"ALTER TABLE {tname} ALTER SQL SECURITY {'DEFINER' if security else 'INVOKER'}",
+                       phase=Phase.TABLE_ALTER)
 
     cons = list(t.constraints)
     ordered = (
-        [c for c in cons if c.is_pkey()]
-        + [c for c in cons if c.is_unique()]
-        + [c for c in cons if c.is_check()]
-        + [c for c in cons if c.is_fkey()]
+        [(Phase.KEY, c) for c in cons if c.is_pkey()]
+        + [(Phase.KEY, c) for c in cons if c.is_unique()]
+        + [(Phase.CHECK, c) for c in cons if c.is_check()]
+        + [(Phase.FOREIGN_KEY, c) for c in cons if c.is_fkey()]
     )
-    for c in ordered:
+    for phase, c in ordered:
         sql = c.get_sql_for("create")
         index = getattr(c, "index", None)
         if index is not None and not c.is_check():
@@ -219,9 +239,9 @@ def _table(ctx: Context, t: Any, path: str) -> Iterator[Artifact]:
             partner = getattr(c, "partner_constraint", None) if c.is_fkey() else None
             if partner is not None and getattr(partner, "index", None) is not None:
                 sql = _quote_segments(sql, partner.index.segment_names, ctx.is_keyword)
-        yield Artifact(path, sql)
-    yield from _plain_stmts(path, _comments(t, t.columns))
-    yield from _plain_stmts(path, _grants(ctx, "relation", t))
+        yield Artifact(path, sql, phase=phase)
+    yield from _plain_stmts(path, _comments(t, t.columns), Phase.COMMENT)
+    yield from _plain_stmts(path, _grants(ctx, "relation", t), Phase.GRANT)
 
 
 def _index(ctx: Context, i: Any, path: str) -> Iterator[Artifact]:
@@ -232,50 +252,52 @@ def _index(ctx: Context, i: Any, path: str) -> Iterator[Artifact]:
     if condition:
         condition = str(condition).strip()
         sql += "\n" + (condition if condition.upper().startswith("WHERE") else f"WHERE {condition}")
-    yield Artifact(path, sql)
+    yield Artifact(path, sql, phase=Phase.INDEX)
     if i.is_inactive():
-        yield Artifact(path, i.get_sql_for("deactivate"))
-    yield from _plain_stmts(path, _comments(i))
+        yield Artifact(path, i.get_sql_for("deactivate"), phase=Phase.INDEX_STATE)
+    yield from _plain_stmts(path, _comments(i), Phase.COMMENT)
 
 
 def _function(ctx: Context, f: Any, path: str) -> Iterator[Artifact]:
     external = _external_routine(f)
     if external is not None:
-        yield Artifact(path, f"{_routine_header(f)}\n{_external_clause(*external)}", psql=True)
+        yield Artifact(path, f"{_routine_header(f)}\n{_external_clause(*external)}", psql=True,
+                       phase=Phase.ROUTINE)
     else:
         sql = f.get_sql_for("create_or_alter")
         if getattr(f, "deterministic_flag", None):
             sql = sql.replace("\nAS\n", " DETERMINISTIC\nAS\n", 1)
-        yield Artifact(path, sql, psql=True)
+        yield Artifact(path, sql, psql=True, phase=Phase.ROUTINE)
     # firebird-lib registers the 'comment' action for external UDFs only.
     if getattr(f, "description", None) is not None:
-        yield Artifact(path, _comment_of(f, "FUNCTION"))
-    yield from _plain_stmts(path, _grants(ctx, "function", f))
+        yield Artifact(path, _comment_of(f, "FUNCTION"), phase=Phase.COMMENT)
+    yield from _plain_stmts(path, _grants(ctx, "function", f), Phase.GRANT)
 
 
 def _view(ctx: Context, v: Any, path: str) -> Iterator[Artifact]:
-    yield Artifact(path, v.get_sql_for("create_or_alter"))
-    yield from _plain_stmts(path, _comments(v, v.columns))
-    yield from _plain_stmts(path, _grants(ctx, "relation", v))
+    yield Artifact(path, v.get_sql_for("create_or_alter"), phase=Phase.VIEW)
+    yield from _plain_stmts(path, _comments(v, v.columns), Phase.COMMENT)
+    yield from _plain_stmts(path, _grants(ctx, "relation", v), Phase.GRANT)
 
 
 def _procedure(ctx: Context, p: Any, path: str) -> Iterator[Artifact]:
     external = _external_routine(p)
     if external is not None:
-        yield Artifact(path, f"{_routine_header(p)}\n{_external_clause(*external)}", psql=True)
+        yield Artifact(path, f"{_routine_header(p)}\n{_external_clause(*external)}", psql=True,
+                       phase=Phase.ROUTINE)
     else:
-        yield Artifact(path, p.get_sql_for("create_or_alter"), psql=True)
-    yield from _plain_stmts(path, _comments(p, list(p.input_params) + list(p.output_params)))
-    yield from _plain_stmts(path, _grants(ctx, "procedure", p))
+        yield Artifact(path, p.get_sql_for("create_or_alter"), psql=True, phase=Phase.ROUTINE)
+    yield from _plain_stmts(path, _comments(p, list(p.input_params) + list(p.output_params)), Phase.COMMENT)
+    yield from _plain_stmts(path, _grants(ctx, "procedure", p), Phase.GRANT)
 
 
 def _package(ctx: Context, pkg: Any, path: str) -> Iterator[Artifact]:
-    yield Artifact(path, pkg.get_sql_for("create_or_alter"), psql=True)
+    yield Artifact(path, pkg.get_sql_for("create_or_alter"), psql=True, phase=Phase.ROUTINE_STUB)
     if getattr(pkg, "body", None):
         # There is no CREATE OR ALTER PACKAGE BODY; RECREATE is the idempotent form.
-        yield Artifact(path, pkg.get_sql_for("recreate", body=True), psql=True)
-    yield from _plain_stmts(path, _comments(pkg))
-    yield from _plain_stmts(path, _grants(ctx, "package", pkg))
+        yield Artifact(path, pkg.get_sql_for("recreate", body=True), psql=True, phase=Phase.ROUTINE)
+    yield from _plain_stmts(path, _comments(pkg), Phase.COMMENT)
+    yield from _plain_stmts(path, _grants(ctx, "package", pkg), Phase.GRANT)
 
 
 def _ddl_trigger_event(raw_type: int) -> str:
@@ -300,8 +322,12 @@ def _ddl_trigger_event(raw_type: int) -> str:
 def _trigger(ctx: Context, tr: Any, path: str) -> Iterator[Artifact]:
     external = _external_routine(tr)
     is_ddl = bool(getattr(tr, "is_ddl_trigger", lambda: False)())
+    is_db = bool(getattr(tr, "is_db_trigger", lambda: False)())
+    # A DDL or database trigger fires on the statements that follow it, so in an
+    # apply order it must come after every definition.
+    phase = Phase.TRIGGER_DDL if (is_ddl or is_db) else Phase.TRIGGER
     if external is None and not is_ddl:
-        yield Artifact(path, tr.get_sql_for("create_or_alter"), psql=True)
+        yield Artifact(path, tr.get_sql_for("create_or_alter"), psql=True, phase=phase)
     else:
         # Same shape as firebird-lib's CREATE TRIGGER, with the pieces it gets wrong.
         header = f"CREATE OR ALTER TRIGGER {tr.get_quoted_name()}"
@@ -312,8 +338,8 @@ def _trigger(ctx: Context, tr: Any, path: str) -> Iterator[Artifact]:
         event = _ddl_trigger_event(int(_attr(tr, "RDB$TRIGGER_TYPE"))) if is_ddl else tr.get_type_as_string()
         header += f"{event} POSITION {tr.sequence}\n"
         body = _external_clause(*external) if external is not None else (tr.source or "")
-        yield Artifact(path, header + body, psql=True)
-    yield from _plain_stmts(path, _comments(tr))
+        yield Artifact(path, header + body, psql=True, phase=phase)
+    yield from _plain_stmts(path, _comments(tr), Phase.COMMENT)
 
 
 # --------------------------------------------------------------------- registry
@@ -326,9 +352,9 @@ CATEGORIES: tuple[Category, ...] = (
     Category("domain", ("domain",), _plain("domains"), _domain),
     Category("table", ("table",), _plain("tables"), _table),
     Category("index", ("index",), _indices, _index),
-    Category("function", ("function",), _psql_functions, _function),
+    Category("function", ("function",), _psql_functions, _function, stubbable=True),
     Category("view", ("view",), _plain("views"), _view),
-    Category("procedure", ("procedure", "proc"), _procedures, _procedure),
+    Category("procedure", ("procedure", "proc"), _procedures, _procedure, stubbable=True),
     Category("package", ("package",), _plain("packages"), _package),
     Category("trigger", ("trigger",), _plain("triggers"), _trigger),
 )
@@ -350,37 +376,38 @@ def database_preamble(ctx: Context) -> list[Artifact]:
     system roles such as RDB$ADMIN."""
     schema = ctx.schema
     path = ctx.layout.database
-    out = [Artifact(path, f"SET SQL DIALECT {ctx.dialect}")]
+    out = [Artifact(path, f"SET SQL DIALECT {ctx.dialect}", phase=Phase.DIALECT)]
     try:
         charset = schema.default_character_set.name
     except Exception:  # noqa: BLE001
         charset = None
     if charset:
-        out.append(Artifact(path, f"-- Default character set: {charset}"))
+        out.append(Artifact(path, f"-- Default character set: {charset}", phase=Phase.DIALECT))
     description = getattr(schema, "description", None)
     if description:
-        out.append(Artifact(path, f"COMMENT ON DATABASE IS '{escape_single_quotes(description)}'"))
+        out.append(Artifact(path, f"COMMENT ON DATABASE IS '{escape_single_quotes(description)}'",
+                            phase=Phase.COMMENT))
 
     for cs in sorted(getattr(schema, "character_sets", ()) or (), key=lambda c: c.name):
         default = getattr(cs, "default_collation", None)
         if default is not None and default.name != cs.name:
-            out.append(Artifact(path, cs.get_sql_for("alter", collation=default)))
+            out.append(Artifact(path, cs.get_sql_for("alter", collation=default), phase=Phase.CHARACTER_SET))
         if getattr(cs, "description", None) is not None:
-            out.append(Artifact(path, cs.get_sql_for("comment")))
+            out.append(Artifact(path, cs.get_sql_for("comment"), phase=Phase.COMMENT))
 
     owner = getattr(schema, "owner_name", None)
     stmts, skipped = render_database_grants(ctx.grants.database, owner=owner, is_keyword=ctx.is_keyword)
-    out += [Artifact(path, s) for s in stmts]
+    out += [Artifact(path, s, phase=Phase.GRANT) for s in stmts]
     if skipped:
         log.warning(f"{skipped} database-level privilege(s) of an unknown kind were not dumped")
 
     # System roles are not dumped as objects, but who holds them is configuration.
     for role in sorted((r for r in schema.roles if _is_sys(r)), key=lambda r: r.name):
-        out += [Artifact(path, s) for s in _grants(ctx, "role", role)]
+        out += [Artifact(path, s, phase=Phase.GRANT) for s in _grants(ctx, "role", role)]
     return out
 
 
 __all__ = [
     "CATEGORIES", "CATEGORY_BY_ALIAS", "CATEGORY_BY_KEY", "CATEGORY_ORDER", "TYPE_CHOICES",
-    "Category", "database_preamble", "quote_ident",
+    "Category", "Phase", "database_preamble", "quote_ident",
 ]

@@ -1,7 +1,8 @@
 """Command line: argument parsing, mode selection, exit codes.
 
 Modes
-  full      no names, no --list: dump the whole schema (atomic: all or nothing)
+  full      no names, no --list: dump the whole schema (atomic: all or nothing).
+            With --out it becomes a tree; without it, one ordered script
   targeted  names given: dump those objects (best effort, exit 3 if incomplete)
   list      --list: print ``type<TAB>name`` per object
 
@@ -103,10 +104,10 @@ class Collector:
             self._claims[path.casefold()] = label
         return True
 
-    def add(self, ctx: Context, cat: categories.Category, obj: Any) -> None:
+    def add(self, ctx: Context, cat: categories.Category, obj: Any, *, stub: bool = False) -> None:
         label = f"{cat.key} {cat.name_of(obj)}"
         try:
-            arts = cat.emit(ctx, obj)
+            arts = cat.emit(ctx, obj, stub=stub)
         except Exception as exc:  # noqa: BLE001 — one object must not sink the run
             log.warning(f"Skipping {label}: {exc}")
             self.failures.append(label)
@@ -149,11 +150,12 @@ def _preload(ctx: Context) -> None:
 def run_full(ctx: Context, out_dir: Path | None, allow_partial: bool, force: bool) -> int:
     log.info("Reading the schema...")
     _preload(ctx)
+    stub = out_dir is None          # the script needs routine headers before bodies
     col = Collector()
     col.add_section("database", lambda: categories.database_preamble(ctx))
     for cat in categories.CATEGORIES:
         for obj in sorted(cat.objects(ctx.schema), key=cat.name_of):  # sorted: stable diffs
-            col.add(ctx, cat, obj)
+            col.add(ctx, cat, obj, stub=stub)
     if ctx.grants.unmapped:
         log.debug(f"{len(ctx.grants.unmapped)} privilege(s) of unknown subject types were ignored")
     if left := ctx.grants.unconsumed():
@@ -164,15 +166,14 @@ def run_full(ctx: Context, out_dir: Path | None, allow_partial: bool, force: boo
                   f"(--allow-partial writes the incomplete tree anyway)")
         return EXIT_PARTIAL
 
-    grouped = writer.group(col.artifacts)
     if out_dir is None:
-        count = writer.write_stdout(grouped)
-        where = "printed"
-    else:
-        count = writer.replace_tree(grouped, out_dir, ctx.layout.to_toml(), force,
-                                    owned=ctx.layout.top_level_entries())
-        where = f"written to {out_dir}"
-    log.info(f"Done: {count} file(s) {where}; {len(col.failures)} object(s) skipped")
+        # One script, ordered so that it applies; the tree keeps its own order.
+        count = writer.write_script(col.artifacts)
+        log.info(f"Done: {count} statement(s) printed as a script; {len(col.failures)} object(s) skipped")
+        return EXIT_PARTIAL if col.failures else EXIT_OK
+    count = writer.replace_tree(writer.group(col.artifacts), out_dir, ctx.layout.to_toml(), force,
+                                owned=ctx.layout.top_level_entries())
+    log.info(f"Done: {count} file(s) written to {out_dir}; {len(col.failures)} object(s) skipped")
     return EXIT_PARTIAL if col.failures else EXIT_OK
 
 
