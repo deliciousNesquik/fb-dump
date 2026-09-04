@@ -33,17 +33,21 @@ def resolve(schema: Any, names: list[str], type_alias: str | None = None) -> Res
         target = name.strip()
         upper = target.upper()
         per_name: list[tuple[Category, Any]] = []
+        found = False       # a repeated name still matched, it is just already collected
         for cat, objs in cat_objects:
             for obj in objs:
                 obj_name = cat.name_of(obj)
                 if obj_name == target or obj_name.upper() == upper:
+                    found = True
                     key = (cat.key, obj_name)
                     if key not in seen:
                         seen.add(key)
                         per_name.append((cat, obj))
-        if not per_name:
+        if not found:
             missing.append(name)
             continue
+        if not per_name:
+            continue        # duplicate of a name already resolved
         if len({c.key for c, _ in per_name}) > 1:
             hit = ", ".join(sorted(c.key for c, _ in per_name))
             log.info(f"{target!r} matched several categories: {hit}")

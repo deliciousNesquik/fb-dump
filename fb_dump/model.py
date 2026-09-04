@@ -43,11 +43,11 @@ class Phase(IntEnum):
     TABLE = 8            # emitted without PK/UNIQUE, so tables never reference each other
     TABLE_ALTER = 9      # identity, SQL SECURITY
     KEY = 10             # PRIMARY KEY, UNIQUE — a foreign key needs them
-    CHECK = 11
-    FOREIGN_KEY = 12     # after every table and key exists
-    INDEX = 13
-    INDEX_STATE = 14     # ALTER INDEX ... INACTIVE
-    ROUTINE_STUB = 15    # headers with empty bodies + package headers
+    ROUTINE_STUB = 11    # headers with empty bodies, package headers, external routines
+    CHECK = 12           # a CHECK expression may call a routine, hence after the stubs
+    FOREIGN_KEY = 13     # after every table and key exists
+    INDEX = 14           # an expression index may call a routine too
+    INDEX_STATE = 15     # ALTER INDEX ... INACTIVE
     VIEW = 16            # may use routines, hence after the stubs
     ROUTINE = 17         # real bodies, any order — every callee exists as a stub
     TRIGGER = 18         # bodies may call routines
@@ -60,7 +60,7 @@ class Phase(IntEnum):
 class Artifact:
     path: str            # tree-relative path, e.g. "07_TABLES/ACCOUNT.sql"
     sql: str             # one statement without terminator; lines starting with "--" are emitted verbatim
-    psql: bool = False   # True -> wrapped in SET TERM ^ ; ... ^
+    psql: bool = False   # True -> wrapped in a SET TERM block (see render.py)
     phase: Phase = Phase.TABLE   # only the single-script output sorts by this
 
 

@@ -70,7 +70,8 @@ def _build_parser() -> argparse.ArgumentParser:
     out.add_argument("--print-layout", action="store_true",
                      help="print the effective layout as TOML (a starting point for your own) and exit")
     out.add_argument("--allow-partial", action="store_true",
-                     help="full dump: write the tree even if some objects could not be dumped")
+                     help="full dump: produce the output (tree or script) even if some objects "
+                          "could not be dumped")
     out.add_argument("--force", action="store_true",
                      help=f"full dump: replace a non-empty directory that has no {layout.MANIFEST} or that "
                           f"contains foreign entries; targeted export: write into such a directory")
@@ -90,9 +91,12 @@ class Collector:
 
     artifacts: list[Artifact] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    check_paths: bool = True                               # a script has no file names to collide
     _claims: dict[str, str] = field(default_factory=dict)  # casefolded path -> owner label
 
     def _claim(self, label: str, arts: list[Artifact]) -> bool:
+        if not self.check_paths:
+            return True
         paths = {a.path for a in arts}
         for path in paths:
             owner = self._claims.get(path.casefold())
@@ -151,7 +155,7 @@ def run_full(ctx: Context, out_dir: Path | None, allow_partial: bool, force: boo
     log.info("Reading the schema...")
     _preload(ctx)
     stub = out_dir is None          # the script needs routine headers before bodies
-    col = Collector()
+    col = Collector(check_paths=not stub)
     col.add_section("database", lambda: categories.database_preamble(ctx))
     for cat in categories.CATEGORIES:
         for obj in sorted(cat.objects(ctx.schema), key=cat.name_of):  # sorted: stable diffs
@@ -163,7 +167,7 @@ def run_full(ctx: Context, out_dir: Path | None, allow_partial: bool, force: boo
 
     if col.failures and not allow_partial:
         log.error(f"{len(col.failures)} object(s) could not be dumped; nothing written "
-                  f"(--allow-partial writes the incomplete tree anyway)")
+                  f"(--allow-partial produces the incomplete result anyway)")
         return EXIT_PARTIAL
 
     if out_dir is None:
@@ -172,7 +176,7 @@ def run_full(ctx: Context, out_dir: Path | None, allow_partial: bool, force: boo
         log.info(f"Done: {count} statement(s) printed as a script; {len(col.failures)} object(s) skipped")
         return EXIT_PARTIAL if col.failures else EXIT_OK
     count = writer.replace_tree(writer.group(col.artifacts), out_dir, ctx.layout.to_toml(), force,
-                                owned=ctx.layout.top_level_entries())
+                                layout=ctx.layout)
     log.info(f"Done: {count} file(s) written to {out_dir}; {len(col.failures)} object(s) skipped")
     return EXIT_PARTIAL if col.failures else EXIT_OK
 
@@ -262,8 +266,7 @@ def main(argv: list[str] | None = None) -> int:
     if out_dir is not None:
         # Fail before spending minutes on the catalog if the target is unusable.
         try:
-            writer.precheck_target(out_dir, args.force,
-                                   owned=None if args.names else lay.top_level_entries())
+            writer.precheck_target(out_dir, args.force, layout=None if args.names else lay)
         except writer.WriterError as exc:
             log.error(str(exc))
             return EXIT_INFRA

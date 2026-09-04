@@ -72,7 +72,12 @@ def set_isolation(name: str | None) -> None:
         raise ValueError(f"unknown isolation {name!r}") from None
 
 
-def _nowait_tpb(isolation, lock_timeout: int = -1, access_mode=TraAccessMode.WRITE) -> bytes:  # noqa: ANN001, ARG001
+def _nowait_tpb(isolation, lock_timeout: int = -1, access_mode=TraAccessMode.READ) -> bytes:  # noqa: ANN001, ARG001
+    """NO WAIT always; read-only unless the caller insists otherwise.
+
+    The driver's own ``tpb`` defaults to WRITE and firebird-lib passes READ
+    explicitly — but the read-only guarantee is ours to keep, so the default is
+    flipped here rather than inherited."""
     return _driver_tpb(_ISOLATION or isolation, lock_timeout=0, access_mode=access_mode)
 
 

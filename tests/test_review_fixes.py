@@ -14,7 +14,7 @@ from fb_dump.layout import MANIFEST, LayoutError, from_dict, preset
 from fb_dump.model import Artifact, Context
 
 MAN = preset("numbered").to_toml()
-OWNED = preset("numbered").top_level_entries()
+OWNED = preset("numbered")
 
 
 def _g(*pairs):
@@ -25,22 +25,22 @@ def _g(*pairs):
 
 def test_unowned_entries_block_replace_unless_forced(tmp_path):
     out = tmp_path / "schema"
-    writer.replace_tree(_g(("DATABASE.sql", "D")), out, MAN, owned=OWNED)
+    writer.replace_tree(_g(("DATABASE.sql", "D")), out, MAN, layout=OWNED)
     (out / ".git").mkdir()
     (out / "README.md").write_text("mine")
-    (out / "stray.sql").write_text("ok")                     # .sql files in the root are tolerated
-    with pytest.raises(writer.WriterError, match=r"\.git, README\.md"):
-        writer.replace_tree(_g(("DATABASE.sql", "D")), out, MAN, owned=OWNED)
+    (out / "stray.sql").write_text("mine")                   # not a file this layout writes
+    with pytest.raises(writer.WriterError, match=r"\.git, README\.md, stray\.sql"):
+        writer.replace_tree(_g(("DATABASE.sql", "D")), out, MAN, layout=OWNED)
     assert (out / "README.md").exists()
-    writer.replace_tree(_g(("DATABASE.sql", "D")), out, MAN, force=True, owned=OWNED)
+    writer.replace_tree(_g(("DATABASE.sql", "D")), out, MAN, force=True, layout=OWNED)
     assert not (out / ".git").exists() and not (out / "stray.sql").exists()
 
 
 def test_switching_layout_is_not_treated_as_foreign_entries(tmp_path):
     out = tmp_path / "schema"
-    writer.replace_tree(_g(("07_TABLES/A.sql", "A")), out, MAN, owned=OWNED)
+    writer.replace_tree(_g(("07_TABLES/A.sql", "A")), out, MAN, layout=OWNED)
     plain = preset("plain")
-    writer.replace_tree(_g(("TABLES/A.sql", "A")), out, plain.to_toml(), owned=plain.top_level_entries())
+    writer.replace_tree(_g(("TABLES/A.sql", "A")), out, plain.to_toml(), layout=plain)
     assert (out / "TABLES/A.sql").exists() and not (out / "07_TABLES").exists()
 
 
@@ -49,7 +49,7 @@ def test_in_place_rebuild_when_cwd_is_inside_the_tree(tmp_path, monkeypatch):
     writer.replace_tree(_g(("DATABASE.sql", "OLD"), ("07_TABLES/A.sql", "A")), out, MAN)
     inode = out.stat().st_ino
     monkeypatch.chdir(out)
-    writer.replace_tree(_g(("DATABASE.sql", "NEW"), ("07_TABLES/B.sql", "B")), Path("."), MAN, owned=OWNED)
+    writer.replace_tree(_g(("DATABASE.sql", "NEW"), ("07_TABLES/B.sql", "B")), Path("."), MAN, layout=OWNED)
     assert out.stat().st_ino == inode                          # the directory itself survived
     assert Path.cwd() == out                                   # …and so did the caller's cwd
     assert (out / "DATABASE.sql").read_text() == "NEW;\n"
@@ -259,7 +259,7 @@ def test_target_is_checked_before_connecting(monkeypatch, tmp_path, capsys):
 
     # a tree of ours with a foreign entry is refused just as early…
     tree = tmp_path / "schema"
-    writer.replace_tree(_g(("DATABASE.sql", "D")), tree, MAN, owned=OWNED)
+    writer.replace_tree(_g(("DATABASE.sql", "D")), tree, MAN, layout=OWNED)
     (tree / ".git").mkdir()
     assert cli.main(["-o", str(tree)]) == 1
     assert calls == []
@@ -345,8 +345,10 @@ def test_stub_only_appears_when_asked_and_never_for_udr():
     stubbed = cat.emit(ctx, FObj("P"), stub=True)
     assert [a.phase for a in stubbed] == [Phase.ROUTINE_STUB, Phase.ROUTINE]
     assert stubbed[0].sql.startswith("CREATE OR ALTER") and "BEGIN\nEND" in stubbed[0].sql
+    # A UDR routine needs no stub — its definition is already header-only — but it
+    # must land in the stub phase, because views and routines after it may call it.
     udr = FObj("U", attributes={"RDB$ENGINE_NAME": "UDR", "RDB$ENTRYPOINT": "x!y"}, source=None)
-    assert [a.phase for a in cat.emit(ctx, udr, stub=True)] == [Phase.ROUTINE]     # nothing to stub
+    assert [a.phase for a in cat.emit(ctx, udr, stub=True)] == [Phase.ROUTINE_STUB]
 
 
 def test_write_script_sorts_by_phase_and_is_stable(capsys):

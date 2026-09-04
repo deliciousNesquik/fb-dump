@@ -65,6 +65,17 @@ def quote_ident(name: str, is_keyword: IsKeyword = None) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _enum_int(priv: Any, prop: str, raw_key: str) -> int | None:
+    """Numeric code of a privilege field, tolerating values firebird-lib's enums
+    do not know. A single unrecognised row must not sink the whole dump: the
+    property raises ``ValueError`` for anything outside ``ObjectType``."""
+    try:
+        return int(getattr(priv, prop))
+    except Exception:  # noqa: BLE001 — unknown or NULL catalog code
+        raw = getattr(priv, "_attributes", {}).get(raw_key)
+        return int(raw) if isinstance(raw, int) else None
+
+
 def _code(priv: Any) -> str:
     value = priv.privilege
     return str(getattr(value, "value", value))
@@ -74,10 +85,10 @@ def _has_grant(priv: Any) -> bool:
     return bool(priv.has_grant())
 
 
-def _grantee(utype: int, name: str, is_keyword: IsKeyword) -> str | None:
+def _grantee(utype: int | None, name: str, is_keyword: IsKeyword) -> str | None:
     if utype == _USER_TYPE and name == "PUBLIC":
         return "PUBLIC"
-    kw = _GRANTEE_KW.get(utype)
+    kw = _GRANTEE_KW.get(utype) if utype is not None else None
     if kw is None:
         return None
     return f"{kw}{quote_ident(name, is_keyword)}"
@@ -101,8 +112,10 @@ class GrantIndex:
         self.database: list[Any] = []
         self.unmapped: list[Any] = []
         for p in privileges:
-            st = int(p.subject_type)
-            if st == _DATABASE_TYPE or st in _DDL_NOUN:
+            st = _enum_int(p, "subject_type", "RDB$OBJECT_TYPE")
+            if st is None:
+                self.unmapped.append(p)
+            elif st == _DATABASE_TYPE or st in _DDL_NOUN:
                 self.database.append(p)
             elif (ns := _SUBJECT_NS.get(st)) is not None:
                 self._objects[(ns, p.subject_name)].append(p)
@@ -123,7 +136,10 @@ def render_grants(privileges: Iterable[Any], namespace: str, subject: str,
     """GRANT statements for one subject. ``subject`` is the already-quoted object name."""
     groups: dict[tuple[int, str, bool, str, str], list[Any]] = {}
     for p in privileges:
-        utype = int(p.user_type)
+        utype = _enum_int(p, "user_type", "RDB$USER_TYPE")
+        if utype is None:
+            log.warning(f"Privilege on {subject} with an unreadable grantee type was not dumped")
+            continue
         marker = (p.field_name or "") if namespace == "role" else ""
         if owner is not None and utype == _USER_TYPE and p.user_name == owner and marker != "D":
             continue  # implicit owner rights
@@ -173,14 +189,19 @@ def render_database_grants(privileges: Iterable[Any], owner: str | None = None,
     """Database-level (DDL) GRANTs. Returns (statements, number of privileges not understood)."""
     out: list[str] = []
     skipped = 0
-    for p in sorted(privileges, key=lambda p: (int(p.subject_type), _code(p), int(p.user_type), p.user_name)):
-        st, code = int(p.subject_type), _code(p)
+    def _key(p: Any) -> tuple:
+        return (_enum_int(p, "subject_type", "RDB$OBJECT_TYPE") or -1, _code(p),
+                _enum_int(p, "user_type", "RDB$USER_TYPE") or -1, p.user_name, p.grantor_name or "")
+
+    for p in sorted(privileges, key=_key):
+        st, code = _enum_int(p, "subject_type", "RDB$OBJECT_TYPE"), _code(p)
         if st == _DATABASE_TYPE:
             what = _DATABASE_VERB.get(code)
         else:
-            verb, noun = _DDL_VERB.get(code), _DDL_NOUN.get(st)
+            verb, noun = _DDL_VERB.get(code), (_DDL_NOUN.get(st) if st is not None else None)
             what = f"{verb} {noun}" if verb and noun else None
-        grantee = _grantee(int(p.user_type), p.user_name, is_keyword)
+        utype = _enum_int(p, "user_type", "RDB$USER_TYPE")
+        grantee = _grantee(utype, p.user_name, is_keyword) if utype is not None else None
         if what is None or grantee is None:
             skipped += 1
             continue

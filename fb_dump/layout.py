@@ -7,6 +7,7 @@ self-describing and a later targeted export into it lands in the right places.
 
 TOML format (every key optional)::
 
+    version = 1                 # format version; written by fb-dump, refused if unknown
     base = "plain"              # preset to start from (default: numbered)
     file = "{name}.sql"         # file-name template: {name}, {type}
     database = "DATABASE.sql"   # database-level file (dialect, database grants)
@@ -25,7 +26,7 @@ import json
 import string
 import tomllib
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 # Canonical category order: order of a full dump and of the numbered preset.
@@ -35,6 +36,7 @@ CATEGORY_KEYS: tuple[str, ...] = (
 )
 
 MANIFEST = ".fb-dump.toml"
+LAYOUT_VERSION = 1              # written into every manifest; a tree from a newer fb-dump is refused
 DEFAULT_PRESET = "numbered"
 DEFAULT_FILE = "{name}.sql"
 DEFAULT_DATABASE = "DATABASE.sql"
@@ -66,7 +68,8 @@ _PLACEHOLDERS = {"name", "type"}
 _UNSAFE_CHARS = set('/\\:*?"<>|')
 _UNSAFE_NO_SEP = _UNSAFE_CHARS - {"/", "\\"}
 _UNSAFE_LIST = ': * ? " < > |'
-_RESERVED_STEMS = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+_RESERVED_STEMS = ({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                   | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)})
 
 
 class LayoutError(Exception):
@@ -83,7 +86,7 @@ def safe_component(name: str) -> str:
     """
     safe = "".join("_" if (ch in _UNSAFE_CHARS or ord(ch) < 32) else ch for ch in name.strip())
     safe = safe.rstrip(". ") or "_"
-    if safe.upper() in _RESERVED_STEMS:
+    if safe.split(".", 1)[0].upper() in _RESERVED_STEMS:   # Windows reserves the stem, so CON.LOG too
         safe += "_"
     return safe
 
@@ -106,12 +109,30 @@ class Layout:
         """Names a tree of this layout may contain at its root (besides object files placed there)."""
         return {self.database} | {d.split("/", 1)[0] for d in self.dirs.values() if d}
 
+    def owns_root_file(self, name: str) -> bool:
+        """True if a file called ``name`` in a tree's root could be one of ours.
+
+        Object files reach the root only from a category whose directory is ``""``,
+        and their extension comes from that category's template — so a hand-written
+        ``notes.sql`` lying next to a ``numbered`` tree is still recognised as a
+        stranger and is not silently deleted."""
+        if name == self.database:
+            return True
+        lower = name.lower()
+        for key, directory in self.dirs.items():
+            if directory:
+                continue
+            suffix = PurePosixPath(self.files.get(key, self.file)).suffix
+            if not suffix or lower.endswith(suffix.lower()):
+                return True
+        return False
+
     def to_toml(self) -> str:
         """Serialise as the manifest written into every tree (deterministic, no timestamps)."""
         lines = [
             "# Written by fb-dump: the layout of this tree. Pass this file to --layout",
             "# to produce the same structure elsewhere.",
-            "version = 1",
+            f"version = {LAYOUT_VERSION}",
             f"file = {_toml_str(self.file)}",
             f"database = {_toml_str(self.database)}",
             "",
@@ -165,6 +186,10 @@ def from_dict(data: Mapping[str, Any], source: str) -> Layout:
     unknown = set(data) - _ALLOWED_KEYS
     if unknown:
         raise LayoutError(f"{source}: unknown keys: {', '.join(sorted(unknown))}")
+    version = data.get("version", LAYOUT_VERSION)
+    if version != LAYOUT_VERSION:
+        raise LayoutError(f"{source}: layout version {version!r} is not supported by this "
+                          f"fb-dump (expected {LAYOUT_VERSION})")
 
     base = data.get("base", DEFAULT_PRESET)
     if base is None:
