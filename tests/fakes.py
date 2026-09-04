@@ -17,19 +17,51 @@ def quoted(name: str) -> str:
     return name if _PLAIN.match(name) else '"' + name.replace('"', '""') + '"'
 
 
-class FPriv:
-    """A row of RDB$USER_PRIVILEGES."""
+class FEnum:
+    """An enum-typed property of firebird-lib (ObjectType, PrivilegeCode, UserType)."""
 
-    def __init__(self, user: str, priv: str, subject: str, *, subject_type: int = 0, user_type: int = 8,
-                 field: str | None = None, grant: bool = False, grantor: str = "SYSDBA") -> None:
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __int__(self) -> int:
+        return int(self.value)
+
+
+UNKNOWN = object()   # a catalog code the library's enum does not know: the property raises
+
+
+class FPriv:
+    """A row of RDB$USER_PRIVILEGES.
+
+    ``subject_type``/``user_type`` may be an int, an :class:`FEnum` or ``UNKNOWN`` —
+    firebird-lib exposes them as enums and raises ``ValueError`` for a code it does
+    not know, which the real catalog does contain (Firebird 4/5 object types).
+    """
+
+    def __init__(self, user: str, priv: Any, subject: str, *, subject_type: Any = 0, user_type: Any = 8,
+                 field: str | None = None, grant: bool = False, grantor: str = "SYSDBA",
+                 raw: dict[str, Any] | None = None) -> None:
         self.user_name = user
         self.privilege = priv          # 'S','I','U','D','R','X','G','M','C','L','O'
         self.subject_name = subject
-        self.subject_type = subject_type
-        self.user_type = user_type
+        self._subject_type = subject_type
+        self._user_type = user_type
         self.field_name = field
         self.grantor_name = grantor
         self._grant = grant
+        self._attributes = raw or {}
+
+    @property
+    def subject_type(self) -> Any:
+        if self._subject_type is UNKNOWN:
+            raise ValueError("unknown object type")
+        return self._subject_type
+
+    @property
+    def user_type(self) -> Any:
+        if self._user_type is UNKNOWN:
+            raise ValueError("unknown user type")
+        return self._user_type
 
     def has_grant(self) -> bool:
         return self._grant

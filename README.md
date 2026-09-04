@@ -91,7 +91,7 @@ Flags take precedence over environment variables. The password is **never** acce
 | `-r`, `--role ROLE` | `FB_ROLE` | — | SQL role to connect with. |
 | `--isolation LEVEL` | `FB_ISOLATION` | `read-committed` | Isolation of the catalog-reading transaction: `read-committed`, `read-consistency` or `snapshot` (see [Isolation](#isolation)). |
 | `--charset CS` | `FB_CHARSET` | `UTF8` | Connection character set (see [Character sets](#character-sets)). |
-| `--fallback-charset CS` | — | — | Second charset for mixed-encoding metadata. |
+| `--fallback-charset CS` | — | — | Second charset for mixed-encoding metadata; must differ from `--charset`. |
 
 `ISC_USER` and `ISC_PASSWORD` are standard variables that the Firebird client library reads itself; `fb-dump` only passes them through. `fb-dump` does not read `.env` files — use the shell (`set -a; . ./.env; set +a`), `direnv`, or `uv run --env-file .env fb-dump …`. The variables are shown in `.env.example`.
 
@@ -105,7 +105,7 @@ fb-dump -d DSN -o schema --layout plain          # directories without numbers
 fb-dump -d DSN > schema.sql
 ```
 
-**Targeted export** — one or more object names. Names are matched case-insensitively; a name found in multiple categories yields multiple files unless `--type` narrows the selection. Without `--out`, SQL is printed to stdout with a `-- ===== path =====` header per object — a preview of the tree file, not the ordered script; with `--out`, only the affected files are overwritten (nothing is deleted — cleaning up obsolete files is the full dump's job). The tool's own tree layout is used.
+**Targeted export** — one or more object names. Names are matched case-insensitively; a name found in multiple categories yields multiple files unless `--type` narrows the selection. Without `--out`, SQL is printed to stdout with a `-- ===== path =====` header per object — a preview of the tree file, not the ordered script; with `--out`, only the affected files are overwritten (nothing is deleted — cleaning up obsolete files is the full dump's job). The layout is taken from the target tree's `.fb-dump.toml`, so the files land exactly where the full dump put them; an explicit `--layout` that contradicts the manifest is a usage error.
 
 ```bash
 fb-dump -d DSN ACCOUNT                        # every ACCOUNT (table, procedure, …)
@@ -129,7 +129,7 @@ fb-dump -d DSN --list | cut -f2 | sort        # pipe-friendly
 | `-o`, `--out DIR` | full, targeted | Write files here instead of stdout. |
 | `--layout PRESET\|FILE` | full, targeted | `numbered` (default), `plain`, `flat`, or a TOML file. |
 | `--print-layout` | — | Print the effective layout as TOML and exit (no database connection). |
-| `--allow-partial` | full | Write the tree even if some objects could not be dumped. |
+| `--allow-partial` | full | Produce the output — tree or script — even if some objects could not be dumped. |
 | `--force` | `--out` | Full dump: replace a directory that has no `.fb-dump.toml` or that contains foreign entries; targeted export: write into such a directory. |
 | `--type TYPE` | targeted, list | Restrict to one category. |
 | `--list` | list | List objects and exit. |
@@ -164,7 +164,7 @@ Each file is the whole object, in this order: definition, comments, grants.
 
 Grantees are always qualified — `TO USER JOE`, `TO ROLE READERS`, `TO PROCEDURE P` — so a user and a role with the same name cannot be confused on replay, and a privilege granted by someone other than the object's owner carries `GRANTED BY`.
 
-Not dumped: system objects (`RDB$…`, constraint-enforcing indices and triggers, identity generators), packaged procedures/functions (they are inside the package body), the owner's implicit privileges on its own objects, generator values, users, shadows. Privileges on system objects are counted and reported, not written. PSQL objects are wrapped in `SET TERM ^ ;` … `SET TERM ; ^`; everything else ends with `;`. The output order is fixed (categories, then names), so repeated dumps of the same schema are byte-identical.
+Not dumped: system objects (`RDB$…`, constraint-enforcing indices and triggers, identity generators), packaged procedures/functions (they are inside the package body), the owner's implicit privileges on its own objects, generator values, users, shadows. Privileges on system objects are counted and reported, not written. PSQL objects are wrapped in `SET TERM ^ ;` … `SET TERM ; ^`; everything else ends with `;`. If a body contains a `^` of its own (in a string or a comment), the next unused character of `~ @ # ! %` is taken as the terminator instead. The output order is fixed (categories, then names), so repeated dumps of the same schema are byte-identical.
 
 ## Directory layout and file names
 
@@ -172,7 +172,7 @@ The directory structure is **data, not code**. Three presets are included:
 
 | Preset | Table `ACCOUNT` ends up at | Note |
 | --- | --- | --- |
-| `numbered` (default) | `07_TABLES/ACCOUNT.sql` | Numbers give a coarse dependency order when files are concatenated. |
+| `numbered` (default) | `07_TABLES/ACCOUNT.sql` | The numbers show the order objects are read in, so the tree browses in dependency order. |
 | `plain` | `TABLES/ACCOUNT.sql` | Same directories without numbers. |
 | `flat` | `ACCOUNT.table.sql` | Everything in one directory; the type is in the file name. |
 
@@ -203,11 +203,11 @@ fb-dump -d DSN -o schema --layout my-layout.toml
 
 Categories you do not mention retain values from `base`. Directory names can be anything your file system accepts, including non-Latin names; they must stay inside the tree (no absolute paths, drive letters or `..`) and must not contain characters Windows rejects (`: * ? " < > |`). Templates take the bare `{name}` and `{type}` placeholders only. Object names are sanitized the same way (plus reserved names like `CON`).
 
-Every tree stores its effective layout in **`.fb-dump.toml`**. This file makes the tree self-describing for any consumer, allows targeted exports to find the right files without knowing the layout in advance, and marks the directory as belonging to fb-dump — a non-empty directory without it will not be touched unless you pass `--force`.
+Every tree stores its effective layout in **`.fb-dump.toml`**, together with `version = 1` — a manifest whose version this fb-dump does not know is refused rather than guessed at. This file makes the tree self-describing for any consumer, allows targeted exports to find the right files without knowing the layout in advance, and marks the directory as belonging to fb-dump — a non-empty directory without it will not be touched unless you pass `--force`.
 
 ## Guarantees
 
-- **Full dump — all or nothing.** The tree is assembled in a staging directory next to the target and swapped in via rename. If even one object fails to read, *nothing* is written, and the exit code is 3: a half-written tree would appear in version control as objects being *deleted*, which is a false record. `--allow-partial` disables this behavior.
+- **Full dump — all or nothing.** The tree is assembled in a staging directory next to the target and swapped in via rename. If even one object fails to read, *nothing* is written (and nothing is printed, in script mode), and the exit code is 3: a half-written tree would appear in version control as objects being *deleted*, which is a false record. `--allow-partial` disables this behavior.
 - **Your directory is safe.** `--out` must be empty, non-existent, or a tree written by fb-dump — and even then a full dump refuses to delete entries the layout does not account for (a `.git` directory, a README) unless you pass `--force`. Keep the tree in its own directory: a repository subdirectory, not its root.
 - **The swap adapts.** Normally the new tree is built next to the target and renamed into place. When the target cannot be renamed — it is a mount point (a Docker volume), your current directory, or Windows has a file in it open — the tree is rebuilt in place: new files first, old entries removed last, never a half-written file.
 - **Determinism.** One schema → the same bytes. No timestamps in the output.
@@ -258,9 +258,9 @@ isql -user SYSDBA -password ... -i schema.sql newdb.fdb
 
 Without `--out`, statements are not grouped per object — they are sorted into phases, so that nothing references an object that does not exist yet:
 
-dialect · roles · collations · character sets · external functions · generators · exceptions · domains · tables (no constraints) · identity and `SQL SECURITY` · primary keys and unique · checks · foreign keys · indices · **routine headers** · views · **routine bodies** · DML triggers · DDL and database triggers · comments · grants
+dialect · roles · collations · character sets · external functions · generators · exceptions · domains · tables (no constraints) · identity and `SQL SECURITY` · primary keys and unique · **routine headers** · checks · foreign keys · indices · inactive indices · views · **routine bodies** · DML triggers · DDL and database triggers · comments · grants
 
-Two of those deserve a note. Every procedure and function is created **twice**: first as a header with an empty body, then with its real body. That is what makes call order irrelevant — when a body is compiled, everything it calls already exists, including mutually recursive routines. And DDL or database triggers come last on purpose: created earlier, they would fire on every statement that follows, which for an audit trigger means logging the entire restore.
+Two of those deserve a note. Every PSQL procedure and function is created **twice**: first as a header with an empty body, then with its real body. That is what makes call order irrelevant — when a body is compiled, everything it calls already exists, including mutually recursive routines. The headers come before checks, indices and views because those may call a routine too. (A routine written in an external engine — a UDR — is already header-only; it is created once, among the headers. So is a package header, whose body follows with the other bodies.) And DDL or database triggers come last on purpose: created earlier, they would fire on every statement that follows, which for an audit trigger means logging the entire restore.
 
 Grants sit at the end because a grantee may be a role, a user, or a PSQL object — 44% of grants in one real schema name a trigger or a procedure.
 
@@ -271,7 +271,7 @@ Known limits of the script, both from the same cause (fb-dump reads no dependenc
 - a computed column that selects from another table may be created before that table — in one real 1,014-table schema, one column does this;
 - a view built on another view is emitted alphabetically, so it may precede its source. Views select from views in none of the schemas measured so far, but nothing prevents it.
 
-Everything is emitted with `CREATE OR ALTER` / `RECREATE` where Firebird supports it, so re-running the script over an existing database is harmless.
+**The script is written for an empty database.** Firebird has `CREATE OR ALTER` for views, procedures, functions, triggers, exceptions and packages, and fb-dump uses it everywhere it exists — but tables, domains, generators, roles, collations, indices and constraints have no such form, so about a quarter of the statements fail on a second run ("Table X already exists"). `isql` does not stop at those errors unless you pass `-b`, but every object that already exists keeps its old definition. Bringing an existing database up to date is a migration — a different job for a different tool.
 
 ## Limitations
 

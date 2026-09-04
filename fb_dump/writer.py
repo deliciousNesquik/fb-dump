@@ -1,7 +1,7 @@
 """Write artifacts as a tree of files, or print them.
 
 The writer knows nothing about Firebird: it groups statements by target path,
-renders each file and writes it. Three operations:
+renders each file and writes it. Four operations:
 
 * ``replace_tree`` — full dump: build the complete tree in a staging directory,
   then swap it in. Normally the staging directory sits next to the target and the
@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Iterable, TextIO
 
 from . import log
-from .layout import MANIFEST, LayoutError, load_manifest
+from .layout import MANIFEST, Layout, LayoutError, load_manifest
 from .model import Artifact, Phase
 from .render import Statement, render
 
@@ -85,29 +85,33 @@ def _check_target(out_dir: Path, force: bool) -> None:
                           f"refusing to touch it — pass --force to override")
 
 
-def _check_unowned_entries(out_dir: Path, owned: Iterable[str] | None, force: bool) -> None:
+def _check_unowned_entries(out_dir: Path, layout: Layout | None, force: bool) -> None:
     """A marked tree may still contain things that are not ours (.git, README…).
-    ``owned`` = None disables the check."""
-    if owned is None or not out_dir.is_dir():
+    ``layout`` = None disables the check."""
+    if layout is None or not out_dir.is_dir():
         return
-    allowed = set(owned) | {MANIFEST, _IN_PLACE_STAGING}
+    allowed = layout.top_level_entries() | {MANIFEST, _IN_PLACE_STAGING}
     try:
-        recorded = load_manifest(out_dir)          # entries of the layout the tree was written with
+        recorded = load_manifest(out_dir)          # the layout the tree was written with
     except LayoutError:
         recorded = None
-    if recorded is not None:
+    if recorded is not None:                       # switching layouts is not a foreign tree
         allowed |= recorded.top_level_entries()
-    strangers = sorted(
-        e.name for e in out_dir.iterdir()
-        if e.name not in allowed and (e.is_dir() or not e.name.lower().endswith(".sql"))
-    )
+
+    def ours(entry: Path) -> bool:
+        if entry.name in allowed:
+            return True
+        return not entry.is_dir() and (layout.owns_root_file(entry.name)
+                                       or (recorded is not None and recorded.owns_root_file(entry.name)))
+
+    strangers = sorted(e.name for e in out_dir.iterdir() if not ours(e))
     if strangers and not force:
         raise WriterError(f"{out_dir} contains entries a full dump would delete: {', '.join(strangers[:5])}"
                           f"{'…' if len(strangers) > 5 else ''} — move them out (keep the tree in its own "
                           f"directory) or pass --force")
 
 
-def precheck_target(out_dir: Path, force: bool = False, owned: Iterable[str] | None = None) -> None:
+def precheck_target(out_dir: Path, force: bool = False, layout: Layout | None = None) -> None:
     """Validate the output directory *before* the schema is read.
 
     Reading a large schema takes minutes; a target that can never be written to
@@ -115,7 +119,7 @@ def precheck_target(out_dir: Path, force: bool = False, owned: Iterable[str] | N
     ``replace_tree``/``update_tree`` — the directory may change while we read."""
     out_dir = Path(out_dir).resolve()
     _check_target(out_dir, force)
-    _check_unowned_entries(out_dir, owned, force)
+    _check_unowned_entries(out_dir, layout, force)
 
 
 def _write_files(grouped: Grouped, root: Path) -> int:
@@ -173,11 +177,11 @@ def _replace_in_place(grouped: Grouped, out_dir: Path, manifest: str, staging: P
 
 
 def replace_tree(grouped: Grouped, out_dir: Path, manifest: str, force: bool = False,
-                 owned: Iterable[str] | None = None) -> int:
+                 layout: Layout | None = None) -> int:
     """Replace ``out_dir`` with a tree containing exactly ``grouped`` + the manifest.
 
-    ``owned`` names the top-level entries the layout produces; anything else found
-    in an existing tree stops the run unless ``force`` is set (None: no such check)."""
+    ``layout`` says which entries the tree may contain; anything else found in an
+    existing tree stops the run unless ``force`` is set (None: no such check)."""
     out_dir = Path(out_dir).resolve()
     parent = out_dir.parent
     staging = parent / f".{out_dir.name}.fb-dump-new"
@@ -188,7 +192,7 @@ def replace_tree(grouped: Grouped, out_dir: Path, manifest: str, force: bool = F
     if previous.is_dir() and not out_dir.exists() and (previous / MANIFEST).exists():
         previous.rename(out_dir)
     _check_target(out_dir, force)
-    _check_unowned_entries(out_dir, owned, force)
+    _check_unowned_entries(out_dir, layout, force)
 
     if _needs_in_place(out_dir):
         log.debug(f"{out_dir} cannot be renamed (mount point, current directory or read-only parent); "
@@ -199,6 +203,7 @@ def replace_tree(grouped: Grouped, out_dir: Path, manifest: str, force: bool = F
     _remove(staging)
     _remove(previous)
     staging.mkdir()
+    in_place = False
     try:
         count = _write_files(grouped, staging)
         (staging / MANIFEST).write_text(manifest, encoding="utf-8", newline="\n")
@@ -211,15 +216,21 @@ def replace_tree(grouped: Grouped, out_dir: Path, manifest: str, force: bool = F
             # Windows: a directory that is somebody's current directory or holds an
             # open file cannot be renamed. Fall back to rebuilding it in place.
             log.debug(f"{out_dir} cannot be renamed ({exc}); rebuilding it in place")
-            return _replace_in_place(grouped, out_dir, manifest, staging=staging)
-        try:
-            staging.rename(out_dir)
-        except Exception:
-            previous.rename(out_dir)
-            raise
+            in_place = True
+        else:
+            try:
+                staging.rename(out_dir)
+            except Exception:
+                previous.rename(out_dir)
+                raise
     except Exception:
         _remove(staging)
         raise
+    if in_place:
+        # Deliberately outside the block above: from here on the staging directory
+        # holds the only copy of the new tree, and deleting it on failure would
+        # leave the caller with neither tree.
+        return _replace_in_place(grouped, out_dir, manifest, staging=staging)
     shutil.rmtree(previous, ignore_errors=True)
     if previous.exists():
         log.warning(f"Could not remove the previous tree {previous}; delete it by hand")
